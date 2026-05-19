@@ -44,12 +44,14 @@ class MVTecDataset_no_seg(torch.utils.data.Dataset):
 
         for defect_type in defect_types:
             if defect_type == 'good':
-                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
+                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png") + \
+                            glob.glob(os.path.join(self.img_path, defect_type) + "/*.bmp")
                 img_tot_paths.extend(img_paths)
                 tot_labels.extend([0] * len(img_paths))
                 tot_types.extend(['good'] * len(img_paths))
             else:
-                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
+                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png") + \
+                            glob.glob(os.path.join(self.img_path, defect_type) + "/*.bmp")
                 img_paths.sort()
                 img_tot_paths.extend(img_paths)
                 tot_labels.extend([1] * len(img_paths))
@@ -98,14 +100,17 @@ class MVTecDataset(torch.utils.data.Dataset):
 
         for defect_type in defect_types:
             if defect_type == 'good':  # Good images (no anomalies)
-                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
+                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png") + \
+                            glob.glob(os.path.join(self.img_path, defect_type) + "/*.bmp")
                 img_tot_paths.extend(img_paths)
                 gt_tot_paths.extend([0] * len(img_paths))
                 tot_labels.extend([0] * len(img_paths))
                 tot_types.extend(['good'] * len(img_paths))
             else:  # Anomalous images
-                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
-                gt_paths = glob.glob(os.path.join(self.gt_path, defect_type) + "/*.png")
+                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png") + \
+                            glob.glob(os.path.join(self.img_path, defect_type) + "/*.bmp")
+                gt_paths = glob.glob(os.path.join(self.gt_path, defect_type) + "/*.png") + \
+                           glob.glob(os.path.join(self.gt_path, defect_type) + "/*.bmp")
                 img_paths.sort()
                 gt_paths.sort()
                 img_tot_paths.extend(img_paths)

@@ -252,9 +252,9 @@ if __name__ == '__main__':
 
     if args.class_ == 'all':
         all = ['carpet', 'bottle', 'hazelnut', 'leather', 'cable', 'capsule', 'grid', 'pill',
-               'transistor', 'metal_nut', 'screw', 'toothbrush', 'zipper', 'tile', 'wood']
-        epoch_ = [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
-        rate_ = [0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005]
+               'transistor', 'metal_nut', 'screw', 'toothbrush', 'zipper', 'tile', 'wood', 'reda']
+        epoch_ = [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+        rate_ = [0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005]
         for class_, epoch, rate in zip(all, epoch_, rate_):
             print(class_)
             print(epoch)
