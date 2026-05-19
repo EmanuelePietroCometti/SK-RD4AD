@@ -1,0 +1,6 @@
+visa/
+mvtec/
+.venv/
+checkpoints/
+__pycache__/
+*.log
