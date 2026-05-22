@@ -24,8 +24,52 @@ import pickle
 import os
 from skimage.segmentation import mark_boundaries
 from torchvision.transforms.functional import normalize
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F_v2
 
 plt.switch_backend('agg')
+
+def apply_dynamic_crop_gpu(images, masks=None, padding=30):
+    """
+    Dynamic crop to center region of interest, executed entirely on GPU.
+    Supports optional mask resizing for test/evaluation phase.
+    """
+    B, C, H, W = images.shape
+    cropped_imgs = []
+    cropped_masks = [] if masks is not None else None
+    
+    gray = images.mean(dim=1)
+    is_dark = gray < 0.94
+    
+    for i in range(B):
+        coords = torch.nonzero(is_dark[i])
+        if coords.numel() == 0:
+            cropped_imgs.append(images[i])
+            if masks is not None: cropped_masks.append(masks[i])
+            continue
+            
+        y_min, x_min = coords.min(dim=0).values
+        y_max, x_max = coords.max(dim=0).values
+        size = torch.maximum(y_max - y_min, x_max - x_min)
+        cy, cx = y_min + (y_max - y_min) // 2, x_min + (x_max - x_min) // 2
+        
+        y1, y2 = torch.clamp(cy - size//2 - padding, min=0), torch.clamp(cy + size//2 + padding, max=H)
+        x1, x2 = torch.clamp(cx - size//2 - padding, min=0), torch.clamp(cx + size//2 + padding, max=W)
+        
+        crop_img = images[i:i+1, :, y1:y2, x1:x2]
+        # InterpolationMode.BILINEAR = 2
+        cropped_imgs.append(F_v2.resize(crop_img, size=[H, W], interpolation=2, antialias=True).squeeze(0))
+        
+        if masks is not None:
+            # Handle mask dims correctly (can be 3D or 4D depending on dataset)
+            crop_mask = masks[i:i+1, y1:y2, x1:x2] if masks.dim() == 3 else masks[i:i+1, :, y1:y2, x1:x2]
+            # InterpolationMode.NEAREST = 0
+            resized_mask = F_v2.resize(crop_mask, size=[H, W], interpolation=0)
+            cropped_masks.append(resized_mask.squeeze(0))
+            
+    if masks is not None:
+        return torch.stack(cropped_imgs), torch.stack(cropped_masks)
+    return torch.stack(cropped_imgs)
 
 # Calculate anomaly score map
 def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
@@ -127,6 +171,14 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
     with torch.no_grad():
         for (img, label, _) in dataloader:
             img = img.to(device) 
+            
+            # Denormalize, Crop, Renormalize
+            mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            img = (img * std_t + mean_t).clamp(0, 1)
+            img = apply_dynamic_crop_gpu(img)
+            img = (img - mean_t) / std_t
+            
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)
             
@@ -254,8 +306,19 @@ def evaluation(encoder,bn, decoder, res, dataloader, device, img_path):
     aupro_list = []
     with torch.no_grad():
         for img, gt, label, _, _ in dataloader:
-
             img = img.to(device)
+            gt = gt.to(device) # Move mask to GPU temporarily for cropping
+            
+            mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            img = (img * std_t + mean_t).clamp(0, 1)
+            
+            # Crop both image and mask concurrently
+            img, gt = apply_dynamic_crop_gpu(img, masks=gt)
+            
+            img = (img - mean_t) / std_t
+            gt = gt.cpu() # Return mask to CPU for thresholding and metrics
+            
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res) 
             # Compute anomaly maps using encoder's first three outputs and decoder's outputs

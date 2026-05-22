@@ -2,21 +2,21 @@ import torch
 from dataset.dataset import get_data_transforms
 from torchvision.datasets import ImageFolder
 from PIL import Image
-from torchvision.transforms.v2.functional import pil_to_tensor
 import numpy as np
 import random
 import os
 from model.resnet import resnet18, resnet34, resnet50, wide_resnet50_2
 from model.de_resnet import de_resnet18, de_resnet34, de_wide_resnet50_2, de_resnet50
-from dataset.dataset import MVTecDataset,MVTecDataset_no_seg
+from dataset.dataset import MVTecDataset, MVTecDataset_no_seg
 import torch.backends.cudnn as cudnn
 import argparse
-from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg
-from torch.nn import functional as F
-import argparse
 import sys
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F_v2
+import torch.nn.functional as F
 import cv2
 
+from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
 
 def raw_tensor_loader(path):
     # Read the image using OpenCV (loads in BGR format by default)
@@ -168,6 +168,18 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     max_pr_epoch = []
     best_avg_score = 0
 
+    # Define v2 pipeline (executed directly on GPU tensors)
+    gpu_transforms = v2.Compose([
+        v2.RandomAffine(degrees=[-10.0, 10.0], translate=[0.02, 0.02], scale=[0.98, 1.02], fill=1.0, interpolation=v2.InterpolationMode.BILINEAR),
+        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
+        v2.RandomGrayscale(p=0.2),
+        v2.RandomApply([v2.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.4)
+    ])
+
+    # Tensors for denormalization/normalization on device
+    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
     # Start training
     for epoch in range(epochs):
         decoder.train()
@@ -176,8 +188,38 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         for img, label in train_dataloader:
             img = img.to(device, non_blocking=True) 
             img = data_transform(img)
+
+            # ==========================================
+            # INLINE GPU AUGMENTATION BLOCK
+            # ==========================================
+            # Denormalize to [0, 1] range for color operations
+            img = img * std_t + mean_t
+            img = img.clamp(0, 1)
+            
+            # Apply Dynamic Crop (Always active to normalize object scale)
+            img = apply_dynamic_crop_gpu(img)
+
+            # Apply Equalization (50% probability)
+            if torch.rand(1, device=device).item() < 0.5:
+                img_uint8 = (img * 255.0).to(torch.uint8)
+                img = F_v2.equalize(img_uint8).to(torch.float32) / 255.0
+
+            # Standard spatial and color transformations
+            img = gpu_transforms(img)
+            
+            # Dynamic Dust Simulation (40% probability)
+            if torch.rand(1, device=device).item() < 0.4:
+                dust_black = torch.rand_like(img[:, 0:1, :, :]) < 0.005
+                dust_white = torch.rand_like(img[:, 0:1, :, :]) < 0.005
+                img = torch.where(dust_black, torch.zeros_like(img), img)
+                img = torch.where(dust_white, torch.ones_like(img), img)
+
+            # Renormalize back to ImageNet standard for ResNet encoder
+            img = (img - mean_t) / std_t
+            # ==========================================
+
             inputs = encoder(img)
-            outputs = decoder(bn(inputs), inputs[0:3], res)  
+            outputs = decoder(bn(inputs), inputs[0:3], res)
 
             # Choose loss function  
             if layerloss == 0:
