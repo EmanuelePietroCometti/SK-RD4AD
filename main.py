@@ -1,6 +1,8 @@
 import torch
 from dataset.dataset import get_data_transforms
 from torchvision.datasets import ImageFolder
+from PIL import Image
+from torchvision.transforms.v2.functional import pil_to_tensor
 import numpy as np
 import random
 import os
@@ -13,6 +15,27 @@ from test import evaluation_me, evaluation_visualization, evaluation, evaluation
 from torch.nn import functional as F
 import argparse
 import sys
+import cv2
+
+
+def raw_tensor_loader(path):
+    # Read the image using OpenCV (loads in BGR format by default)
+    # This operation is highly optimized and releases the Python GIL
+    img_bgr = cv2.imread(path)
+    
+    if img_bgr is None:
+        print(f"Warning: OpenCV failed to load {path}. Returning empty tensor.")
+        # Fallback tensor to prevent training crashes on a corrupted image
+        return torch.zeros((3, 256, 256), dtype=torch.uint8)
+        
+    # Convert from BGR to RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    
+    # Convert numpy array (H, W, C) to PyTorch tensor (C, H, W)
+    # contiguous() ensures memory alignment for optimal GPU transfer
+    tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).contiguous()
+    
+    return tensor
 
 # Set random seed
 def setup_seed(seed): 
@@ -87,21 +110,28 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     if not os.path.exists(save_path):
         os.mkdir(save_path)
     data_transform, gt_transform = get_data_transforms(image_size, image_size) 
+    data_transform = data_transform.to(device)
+    gt_transform = gt_transform.to(device)
 
     train_path = data_path + class_ + '/train'
     test_path = data_path + class_ 
     ckp_path = save_path + net + class_ 
 
-    train_data = ImageFolder(root=train_path, transform=data_transform)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8)
+    train_data = ImageFolder(root=train_path, loader=raw_tensor_loader)
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+
+    data_transforms, _ = get_data_transforms(size=image_size, isize=image_size)
+
+    # Move transforms to GPU (useful for certain v2 operations)
+    data_transforms = data_transforms.to(device)
 
     # Whether to use segmentation
     if seg == 0:  
-        test_data = MVTecDataset_no_seg(root=test_path, transform=data_transform, phase="test") 
-        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=8)
+        test_data = MVTecDataset_no_seg(root=test_path, transform=data_transforms, phase="test") 
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=8, pin_memory=True)
     if seg == 1:
-        test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test") 
-        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=8)
+        test_data = MVTecDataset(root=test_path, transform=data_transforms, gt_transform=gt_transform, phase="test") 
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=8, pin_memory=True)
 
     # Choose which network to use
     if net == 'wide_res50':   
@@ -144,7 +174,8 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         bn.train()
         loss_list = []
         for img, label in train_dataloader:
-            img = img.to(device) 
+            img = img.to(device, non_blocking=True) 
+            img = data_transform(img)
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)  
 
@@ -176,22 +207,22 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 print('------------------')
 
                 # Save model only if Sample AUROC is the maximum
-                current_avg_score = auroc_sp
+                current_auroc_score = auroc_sp
 
-                if current_avg_score > best_avg_score:
+                if current_auroc_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
                     torch.save({'bn': bn.state_dict(),'decoder': decoder.state_dict()}, ckp_path + str(epoch+1) + str(seed) + 'sample_auc=' + str(auroc_sp) + '.pth')
-                    best_avg_score = current_avg_score
+                    best_avg_score = current_auroc_score
                
                 if vis == 1:  # Visualization output when no mask
-                    evaluation_visualization_no_seg(encoder, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
+                    evaluation_visualization_no_seg(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
 
             # Test set with mask and need localization
             if seg == 1:
                 # Go through normal process
                 # Plot
                 if vis == 1:
-                    evaluation_visualization(encoder, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
+                    evaluation_visualization(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
                 # This part calculates the basic results and saves the results of the current epoch.
                 auroc_px, auroc_sp, aupro_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
                 print('Pixel Auroc: {:.3f}, Sample Auroc: {:.3f}, Pixel Aupro: {:.3}'.format(auroc_px, auroc_sp, aupro_px))
@@ -210,13 +241,12 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 print('max_pr = ', max(max_pr))
                 print('max_epoch = ', max_pr_epoch[max_pr.index(max(max_pr))])
 
-                # Calculate the average score of the current epoch
-                current_avg_score = (auroc_px + aupro_px) / 2
+                # Save model only if Sample AUROC is the maximum
+                current_avg_score = auroc_sp
 
-                # Save model only if the average of AUROC and AUPRO is the maximum
                 if current_avg_score > best_avg_score:
-                    print(f"New best model found at epoch {epoch+1} with average score: {current_avg_score:.3f} (Pixel Auroc{auroc_px:.3f}/Pixel Aupro{aupro_px:.3f})")
-                    torch.save(decoder.state_dict(), ckp_path + str(epoch+1) + str(seed) + 'pixel_auc=' + str(auroc_px) +'aupro=' + str(aupro_px) +'.pth')
+                    print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
+                    torch.save({'bn': bn.state_dict(),'decoder': decoder.state_dict()}, ckp_path + str(epoch+1) + str(seed) + 'sample_auc=' + str(auroc_sp) + '.pth')
                     best_avg_score = current_avg_score
     return auroc_sp
 

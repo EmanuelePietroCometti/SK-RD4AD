@@ -1,5 +1,6 @@
 import torch
-from torchvision import transforms
+from torchvision.transforms import v2
+from torchvision.transforms.v2.functional import pil_to_tensor
 from PIL import Image
 import os
 import glob
@@ -10,17 +11,20 @@ import numpy as np
 def get_data_transforms(size, isize):
     mean_train = [0.485, 0.456, 0.406]
     std_train = [0.229, 0.224, 0.225]
-    data_transforms = transforms.Compose([
-        transforms.Resize((size, size)),  # Resize image to specified size
-        transforms.ToTensor(),  # Convert image to tensor
-        transforms.CenterCrop(isize),  # Crop the center of the image to isize
-        transforms.Normalize(mean=mean_train, std=std_train)  # Normalize the image
+    
+    data_transforms = v2.Compose([
+        v2.Resize((size, size), antialias=True),
+        v2.CenterCrop(isize),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=mean_train, std=std_train)
     ])
-    gt_transforms = transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.CenterCrop(isize),
-        transforms.ToTensor()  # Convert ground truth image to tensor
+    
+    gt_transforms = v2.Compose([
+        v2.Resize((size, size), antialias=True),
+        v2.CenterCrop(isize),
+        v2.ToDtype(torch.float32, scale=True)
     ])
+    
     return data_transforms, gt_transforms
 
 # Custom dataset class for MVTec dataset
@@ -30,8 +34,6 @@ class MVTecDataset_no_seg(torch.utils.data.Dataset):
             self.img_path = os.path.join(root, 'train')
         else:
             self.img_path = os.path.join(root, 'test')
-        self.transform = transform
-        # load dataset
         self.img_paths, self.labels, self.types = self.load_dataset()  # self.labels => good : 0, anomaly : 1
 
     def load_dataset(self):
@@ -66,27 +68,24 @@ class MVTecDataset_no_seg(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img_path,  label, img_type = self.img_paths[idx],  self.labels[idx], self.types[idx]
-        img = Image.open(img_path).convert('RGB')
 
-        img = np.array(img)
-        #print(img.shape)
-        img = Image.fromarray(img)
+        # Open image using PIL to support .bmp formats, convert to RGB
+        img_pil = Image.open(img_path).convert('RGB')
+        # Convert PIL image directly to a uint8 tensor (C, H, W)
+        img = pil_to_tensor(img_pil)
 
-        img = self.transform(img)
-
-        #assert img.size()[1:] == gt.size()[1:], "image.size != gt.size !!!"
-        #print(img.shape,img_type)
         return img, label, img_type
 
 class MVTecDataset(torch.utils.data.Dataset):
     def __init__(self, root, transform, gt_transform, phase):
+        self.transform = transform 
+        self.gt_transform = gt_transform
+
         if phase == 'train':
             self.img_path = os.path.join(root, 'train')  # Path for training images
         else:
             self.img_path = os.path.join(root, 'test')  # Path for test images
             self.gt_path = os.path.join(root, 'ground_truth')  # Path for ground truth images
-        self.transform = transform
-        self.gt_transform = gt_transform
         # Load dataset
         self.img_paths, self.gt_paths, self.labels, self.types = self.load_dataset()  # self.labels => good : 0, anomaly : 1
 
@@ -127,15 +126,24 @@ class MVTecDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img_path, gt, label, img_type = self.img_paths[idx], self.gt_paths[idx], self.labels[idx], self.types[idx]
-        img = Image.open(img_path).convert('RGB')  # Open image and convert to RGB
-        img = self.transform(img)  # Apply transformations to image
+        
+        # Open image using PIL to support .bmp formats, convert to RGB
+        img_pil = Image.open(img_path).convert('RGB')
+        
+        # Convert PIL image directly to a uint8 tensor (C, H, W)
+        img = pil_to_tensor(img_pil)
+        
+        img = self.transform(img) 
+            
         if gt == 0:
-            gt = torch.zeros([1, img.size()[-2], img.size()[-2]])  # If ground truth is 0, create a zero tensor
+            # Create a blank ground truth mask if the image is 'good'
+            # Note: img is now transformed, so we use its new spatial dimensions
+            gt = torch.zeros([1, img.shape[-2], img.shape[-1]], dtype=torch.uint8)
         else:
-            gt = Image.open(gt)  # Open ground truth image
-            gt = self.gt_transform(gt)  # Apply transformations to ground truth image
-
-        assert img.size()[1:] == gt.size()[1:], "Mismatch between image size and ground truth size!"
+            # Load ground truth mask, convert to grayscale, and transform
+            gt_pil = Image.open(gt).convert('L')
+            gt = pil_to_tensor(gt_pil)
+            gt = self.gt_transform(gt)
 
         return img, gt, label, img_type, img_path
     
@@ -181,16 +189,15 @@ class MVTecDataset_no_seg(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img_path,  label, img_type = self.img_paths[idx],  self.labels[idx], self.types[idx]
-        img = Image.open(img_path).convert('RGB')
-
-        img = np.array(img)
-        #print(img.shape)
-        img = Image.fromarray(img)
-
+        
+        # Open image using PIL to support .bmp formats, convert to RGB
+        img_pil = Image.open(img_path).convert('RGB')
+        
+        # Convert PIL image directly to a uint8 tensor (C, H, W)
+        img = pil_to_tensor(img_pil)
+        
         img = self.transform(img)
-
-        #assert img.size()[1:] == gt.size()[1:], "image.size != gt.size !!!"
-        #print(img.shape,img_type)
+            
         return img, label, img_type
     
 
@@ -367,10 +374,10 @@ class visADataset(torch.utils.data.Dataset):
 def load_data(dataset_name='mnist', normal_class=0, batch_size=16):
 
     if dataset_name == 'cifar10':
-        img_transform = transforms.Compose([
-            transforms.Resize((32, 32)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        img_transform = v2.Compose([
+            v2.Resize((32, 32)),
+            v2.ToTensor(),
+            v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
         ])
 
         os.makedirs("./Dataset/CIFAR10/train", exist_ok=True)
@@ -386,9 +393,9 @@ def load_data(dataset_name='mnist', normal_class=0, batch_size=16):
         print("Test Data:", test_set.data.shape)
 
     elif dataset_name == 'mnist':
-        img_transform = transforms.Compose([
-            transforms.Resize((32, 32)),
-            transforms.ToTensor()
+        img_transform = v2.Compose([
+            v2.Resize((32, 32)),
+            v2.ToTensor()
         ])
 
         os.makedirs("./Dataset/MNIST/train", exist_ok=True)
@@ -404,9 +411,9 @@ def load_data(dataset_name='mnist', normal_class=0, batch_size=16):
         print("Test Data:", test_set.data.shape)
 
     elif dataset_name == 'fashionmnist':
-        img_transform = transforms.Compose([
-            transforms.Resize((32, 32)),
-            transforms.ToTensor()
+        img_transform = v2.Compose([
+            v2.Resize((32, 32)),
+            v2.ToTensor()
         ])
 
         os.makedirs("./Dataset/FashionMNIST/train", exist_ok=True)
@@ -424,9 +431,9 @@ def load_data(dataset_name='mnist', normal_class=0, batch_size=16):
     elif dataset_name == 'retina':
         data_path = 'Dataset/OCT2017/train'
 
-        orig_transform = transforms.Compose([
-            transforms.Resize([128, 128]),
-            transforms.ToTensor()
+        orig_transform = v2.Compose([
+            v2.Resize([128, 128]),
+            v2.ToTensor()
         ])
 
         dataset = ImageFolder(root=data_path, transform=orig_transform)

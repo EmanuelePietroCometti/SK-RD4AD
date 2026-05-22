@@ -4,3 +4,4 @@ mvtec/
 checkpoints/
 __pycache__/
 *.log
+results_*/

@@ -23,6 +23,7 @@ import matplotlib
 import pickle
 import os
 from skimage.segmentation import mark_boundaries
+from torchvision.transforms.functional import normalize
 
 plt.switch_backend('agg')
 
@@ -154,9 +155,10 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
     return auroc_sp
 
 # Generate heatmaps for evaluation visualization
-def evaluation_visualization(encoder, decoder, res, dataloader, device, print_canshu, score_num, img_path):
+def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, print_canshu, score_num, img_path):
     count = 0
     decoder.eval()
+    bn.eval()
     with torch.no_grad():
         for img, gt, label, _, ip in dataloader:
             print(ip[0][-20:-4])
@@ -164,9 +166,9 @@ def evaluation_visualization(encoder, decoder, res, dataloader, device, print_ca
                 continue
             img = img.to(device)
             inputs = encoder(img)
-            outputs = decoder(inputs[3], inputs[0:3], res)  
+            outputs = decoder(bn(inputs), inputs[0:3], res)  
 
-            anomaly_map, amap_list = cal_anomaly_map([inputs[0:3][-1]], [outputs[-1]], img.shape[-1], amap_mode='a')  # Generate anomaly map
+            anomaly_map, amap_list = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')  # Generate anomaly map
             anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian filter
             ano_map = min_max_norm(anomaly_map)  # Normalize data
 
@@ -201,18 +203,19 @@ def evaluation_visualization(encoder, decoder, res, dataloader, device, print_ca
             count += 1
 
 # Generate heatmaps for evaluation visualization without segmentation
-def evaluation_visualization_no_seg(encoder, decoder, res, dataloader, device, print_canshu, score_num, img_path):
+def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, device, print_canshu, score_num, img_path):
     count = 0
     decoder.eval()
+    bn.eval()
     with torch.no_grad():
         for img, label, _  in dataloader:
             if (label.item() == 0):
                 continue
             img = img.to(device)
             inputs = encoder(img)
-            outputs = decoder(inputs[3], inputs[0:3], res)  
+            outputs = decoder(bn(inputs), inputs[0:3], res)  
 
-            anomaly_map, amap_list = cal_anomaly_map([inputs[0:3][-1]], [outputs[-1]], img.shape[-1], amap_mode='a')  # Generate anomaly map
+            anomaly_map, amap_list = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')  # Generate anomaly map
             anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian filter
             ano_map = min_max_norm(anomaly_map)  # Normalize data
 
