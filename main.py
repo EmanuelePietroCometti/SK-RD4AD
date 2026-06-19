@@ -135,29 +135,35 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
     # Choose which network to use
     if net == 'wide_res50':   
-        encoder, bn = wide_resnet50_2(pretrained=True)  # Encoder
+        encoder, bn = wide_resnet50_2(pretrained=True)  # Encoder and bottleneck
         encoder = encoder.to(device)
         bn = bn.to(device)
-        encoder.eval()  # Fix encoder model parameters    
-        decoder = de_wide_resnet50_2(pretrained=False)  # Decoder, inverse structure of encoder
+        encoder.eval()  # Freeze encoder model parameters    
+        decoder = de_wide_resnet50_2(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
+        
     if net == 'res18':
-        encoder = resnet18(pretrained=True)  # Encoder
+        encoder, bn = resnet18(pretrained=True)  # Unpack encoder and bottleneck
         encoder = encoder.to(device)
-        encoder.eval()  # Fix encoder model parameters    
-        decoder = de_resnet18(pretrained=False)  # Decoder, inverse structure of encoder
+        bn = bn.to(device)  # Move bottleneck to device
+        encoder.eval()  # Freeze encoder model parameters    
+        decoder = de_resnet18(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
+        
     if net == 'res34':
-        encoder = resnet34(pretrained=True)  # Encoder
+        encoder, bn = resnet34(pretrained=True)  # Unpack encoder and bottleneck
         encoder = encoder.to(device)
-        encoder.eval()  # Fix encoder model parameters    
-        decoder = de_resnet34(pretrained=False)  # Decoder, inverse structure of encoder
+        bn = bn.to(device)  # Move bottleneck to device
+        encoder.eval()  # Freeze encoder model parameters    
+        decoder = de_resnet34(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
+        
     if net == 'res50':
-        encoder = resnet50(pretrained=True)  # Encoder
+        encoder, bn = resnet50(pretrained=True)  # Unpack encoder and bottleneck
         encoder = encoder.to(device)
-        encoder.eval()  # Fix encoder model parameters    
-        decoder = de_resnet50(pretrained=False)  # Decoder, inverse structure of encoder
+        bn = bn.to(device)  # Move bottleneck to device
+        encoder.eval()  # Freeze encoder model parameters    
+        decoder = de_resnet50(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
 
     optimizer = torch.optim.Adam(list(decoder.parameters())+list(bn.parameters()), lr=learning_rate, betas=(0.5,0.999))  # Pass a list of parameters to be optimized
@@ -206,13 +212,6 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
             # Standard spatial and color transformations
             img = gpu_transforms(img)
-            
-            # Dynamic Dust Simulation (40% probability)
-            if torch.rand(1, device=device).item() < 0.4:
-                dust_black = torch.rand_like(img[:, 0:1, :, :]) < 0.005
-                dust_white = torch.rand_like(img[:, 0:1, :, :]) < 0.005
-                img = torch.where(dust_black, torch.zeros_like(img), img)
-                img = torch.where(dust_white, torch.ones_like(img), img)
 
             # Renormalize back to ImageNet standard for ResNet encoder
             img = (img - mean_t) / std_t

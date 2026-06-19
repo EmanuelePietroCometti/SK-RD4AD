@@ -168,13 +168,18 @@ class MVTecDataset_no_seg(torch.utils.data.Dataset):
         defect_types = os.listdir(self.img_path)
 
         for defect_type in defect_types:
+            img_paths = (
+                glob.glob(os.path.join(self.img_path, defect_type) + "/*.png") +
+                glob.glob(os.path.join(self.img_path, defect_type) + "/*.jpg") +
+                glob.glob(os.path.join(self.img_path, defect_type) + "/*.JPG") +
+                glob.glob(os.path.join(self.img_path, defect_type) + "/*.jpeg") +
+                glob.glob(os.path.join(self.img_path, defect_type) + "/*.bmp")
+            )
             if defect_type == 'good':
-                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
                 img_tot_paths.extend(img_paths)
                 tot_labels.extend([0] * len(img_paths))
                 tot_types.extend(['good'] * len(img_paths))
             else:
-                img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
                 img_paths.sort()
                 img_tot_paths.extend(img_paths)
                 tot_labels.extend([1] * len(img_paths))
