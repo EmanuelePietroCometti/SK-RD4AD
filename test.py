@@ -19,6 +19,9 @@ from scipy.ndimage import gaussian_filter
 from sklearn import manifold
 from matplotlib.ticker import NullFormatter
 from scipy.spatial.distance import pdist
+from sklearn.metrics import (roc_auc_score, average_precision_score, 
+                             precision_recall_curve, f1_score, 
+                             precision_score, recall_score)
 import matplotlib
 import pickle
 import os
@@ -250,7 +253,8 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, prin
                 os.mkdir(img_path)
 
             # Save image
-            plt.savefig(img_path + str(ip[0][-20:-4]).replace('/', '_') + '.png')
+            file_name = os.path.basename(ip[0])
+            plt.savefig(os.path.join(img_path, file_name))
 
             count += 1
 
@@ -295,58 +299,96 @@ def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, devic
 
             count += 1
 
-# Evaluation with segmentation, very time-consuming
-def evaluation(encoder,bn, decoder, res, dataloader, device, img_path):
+# Evaluation with segmentation (GPU-accelerated with full metrics)
+def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
     decoder.eval()
     bn.eval()
+    
     gt_list_px = []
     pr_list_px = []
     gt_list_sp = []
     pr_list_sp = []
     aupro_list = []
+    
+    # Pre-define Gaussian kernel on GPU for speed optimization
+    kernel_size = 15
+    sigma = 4
+    x = torch.arange(kernel_size, device=device).float() - kernel_size // 2
+    gauss = torch.exp(-x**2 / (2 * sigma**2))
+    kernel = (gauss[:, None] * gauss[None, :])
+    kernel = (kernel / kernel.sum()).view(1, 1, kernel_size, kernel_size)
+
     with torch.no_grad():
         for img, gt, label, _, _ in dataloader:
-            img = img.to(device)
-            gt = gt.to(device) # Move mask to GPU temporarily for cropping
+            img = img.to(device, non_blocking=True)
+            gt = gt.to(device, non_blocking=True)
             
-            mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-            img = (img * std_t + mean_t).clamp(0, 1)
-            
-            # Crop both image and mask concurrently
+            # Dynamic crop executed on GPU
             img, gt = apply_dynamic_crop_gpu(img, masks=gt)
             
-            img = (img - mean_t) / std_t
-            gt = gt.cpu() # Return mask to CPU for thresholding and metrics
-            
             inputs = encoder(img)
-            outputs = decoder(bn(inputs), inputs[0:3], res) 
-            # Compute anomaly maps using encoder's first three outputs and decoder's outputs
-            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian filter
-
-            gt[gt > 0.5] = 1
-            gt[gt <= 0.5] = 0
-            # gt = gt.int()
-
-            #unique_values = torch.unique(gt)
-            #print("Unique values in gt:", unique_values)
-
+            outputs = decoder(bn(inputs), inputs[0:3], res)
+            
+            # Anomaly Map Calculation on GPU
+            anomaly_map = torch.zeros((1, 1, 256, 256), device=device)
+            for i in range(len(outputs)):
+                dist = 1 - F.cosine_similarity(inputs[i], outputs[i], dim=1).unsqueeze(1)
+                anomaly_map += F.interpolate(dist, size=256, mode='bilinear', align_corners=False)
+            
+            # Apply Gaussian blur on GPU
+            anomaly_map = F.conv2d(anomaly_map, kernel, padding=kernel_size//2)
+            gt = (gt > 0.5).float()
+            
+            # AUPRO Calculation (Requires CPU execution for regionprops)
             if label.item() != 0:
-                # print(gt.squeeze(0).cpu().numpy().astype(int))
-                # print(set(gt.flatten()))
-                aupro_list.append(compute_pro(gt.squeeze(0).cpu().numpy().astype(int),
-                                              anomaly_map[np.newaxis, :, :]))
+                gt_cpu = gt.squeeze().cpu().numpy().astype(int)
+                amap_cpu = anomaly_map.squeeze().cpu().numpy()
+                # Add np.newaxis to resolve the 3D shape assertion error (1, H, W)
+                aupro_list.append(compute_pro(gt_cpu[np.newaxis, :, :], amap_cpu[np.newaxis, :, :]))
+            
+            # Tensors for Pixel-level metrics (Segmentation)
+            gt_list_px.append(gt.view(-1))
+            pr_list_px.append(anomaly_map.view(-1))
+            
+            # Tensors for Sample-level metrics (Image classification)
+            gt_list_sp.append(label.item())
+            pr_list_sp.append(anomaly_map.max().item())
 
-            # Convert multi-dimensional arrays to one-dimensional arrays
-            gt_list_px.extend(gt.cpu().numpy().astype(int).ravel())
-            pr_list_px.extend(anomaly_map.ravel())
-
-            gt_list_sp.append(np.max(gt.cpu().numpy().astype(int)))
-            pr_list_sp.append(np.max(anomaly_map))
-        auroc_px = round(roc_auc_score(gt_list_px, pr_list_px), 3)
-        auroc_sp = round(roc_auc_score(gt_list_sp, pr_list_sp), 3)
-    return auroc_px, auroc_sp, round(np.mean(aupro_list), 3)
+    # Final synchronization with CPU only at the end of the epoch
+    gt_px = torch.cat(gt_list_px).cpu().numpy().astype(int)
+    pr_px = torch.cat(pr_list_px).cpu().numpy()
+    
+    gt_sp = np.array(gt_list_sp)
+    pr_sp = np.array(pr_list_sp)
+    
+    # ---------------------------------------------------------
+    # PIXEL-LEVEL METRICS (Defect Localization)
+    # ---------------------------------------------------------
+    auroc_px = round(roc_auc_score(gt_px, pr_px), 3)
+    ap_loc = round(average_precision_score(gt_px, pr_px), 3)
+    aupro = round(np.mean(aupro_list), 3) if len(aupro_list) > 0 else 0.0
+    
+    # ---------------------------------------------------------
+    # SAMPLE-LEVEL METRICS (Image Classification)
+    # ---------------------------------------------------------
+    auroc_sp = round(roc_auc_score(gt_sp, pr_sp), 3)
+    
+    # Dynamically find the optimal threshold at the SAMPLE level
+    precisions, recalls, thresholds = precision_recall_curve(gt_sp, pr_sp)
+    f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-10)
+    best_idx = np.argmax(f1_scores)
+    
+    # Prevent index out of bounds if best_idx is the very last element
+    best_idx = min(best_idx, len(thresholds) - 1) 
+    best_threshold = thresholds[best_idx]
+    
+    pr_sp_binary = (pr_sp >= best_threshold).astype(int)
+    
+    optimal_f1_sp = round(f1_score(gt_sp, pr_sp_binary), 3)
+    optimal_prec_sp = round(precision_score(gt_sp, pr_sp_binary), 3)
+    optimal_rec_sp = round(recall_score(gt_sp, pr_sp_binary), 3)
+    
+    return auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp
 
 
 # Evaluation with segmentation, very time-consuming

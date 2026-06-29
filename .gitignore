@@ -5,6 +5,7 @@ checkpoints/
 __pycache__/
 *.log
 results_*/
+result*/
 tuning_imgs
 tuning_ckpoints
 sk_rd4ad_tuning.db

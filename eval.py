@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from sklearn.metrics import (roc_auc_score, f1_score, precision_score, 
                              recall_score, accuracy_score, confusion_matrix, 
-                             precision_recall_curve)
+                             precision_recall_curve, average_precision_score)
+from test import compute_pro
 from torch.utils.data import DataLoader
 
 from dataset.dataset import get_data_transforms, MVTecDataset, MVTecDataset_no_seg
@@ -74,13 +75,13 @@ def save_confusion_map(img_tensor, mask_tensor, anomaly_map_tensor, save_path, g
     # Prepare the colored map
     amap_colored = np.zeros_like(amap)
     
-    # 1. Normal pixels (Below Threshold) -> Scale relative to the global dataset baseline
+    # Normal pixels (Below Threshold) -> Scale relative to the global dataset baseline
     # This ensures that a normal image looks completely blue, exactly like the background of a defective image
     mask_normal = amap < threshold
     if (threshold - global_min) > 0:
         amap_colored[mask_normal] = 0.5 * ((amap[mask_normal] - global_min) / (threshold - global_min))
         
-    # 2. Anomalous pixels (Above Threshold) -> Scale relative to THIS IMAGE's peak
+    # Anomalous pixels (Above Threshold) -> Scale relative to THIS IMAGE's peak
     # This guarantees that the worst defect in this specific image hits 1.0 (Deep Red)
     mask_anomalous = amap >= threshold
     if image_max > threshold:
@@ -224,40 +225,91 @@ def evaluate_and_save_maps(args):
                 'score': score
             })
 
-    # Extract raw arrays
+    # Extract raw arrays for image-level evaluation
     y_true = np.array([r['label'] for r in results_memory])
     raw_scores = np.array([r['score'] for r in results_memory])
 
-    # Calculate GLOBAL spatial map min and max FROM RAW DATA
+    # Calculate global spatial map limits for visualization normalization
     global_max = raw_scores.max()
     global_min = min([r['anomaly_map'].min().item() for r in results_memory])
 
-    # Find optimal threshold using F1-Score maximization on RAW scores
+    # ---------------------------------------------------------
+    # SAMPLE-LEVEL METRICS (Image Classification)
+    # ---------------------------------------------------------
+    # Dynamically find the optimal threshold using F1-Score maximization
     precisions, recalls, thresholds = precision_recall_curve(y_true, raw_scores)
     f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-10)
     best_idx = np.argmax(f1_scores)
     best_threshold_raw = thresholds[best_idx]
     
-    # Generate predictions based on the raw threshold
+    # Generate binary predictions based on the optimal threshold
     y_pred = (raw_scores >= best_threshold_raw).astype(int)
     
-    # Calculate metrics
-    auroc = roc_auc_score(y_true, raw_scores)
+    # Calculate sample-level classification metrics
+    auroc_sp = roc_auc_score(y_true, raw_scores)
     cm = confusion_matrix(y_true, y_pred)
+    f1_sp = f1_score(y_true, y_pred)
+    prec_sp = precision_score(y_true, y_pred)
+    rec_sp = recall_score(y_true, y_pred)
+    acc_sp = accuracy_score(y_true, y_pred)
 
-    print("=" * 40)
+    # ---------------------------------------------------------
+    # PIXEL-LEVEL METRICS (Defect Localization)
+    # ---------------------------------------------------------
+    if args.seg == 1:
+        print("Calculating pixel-level metrics (AUPRO, AP-loc, AUROC). This may take a moment...")
+        gt_list_px = []
+        pr_list_px = []
+        aupro_list = []
+        
+        for res in results_memory:
+            if res['mask'] is not None:
+                # Extract and binarize the ground truth mask
+                mask_np = res['mask'].squeeze().numpy()
+                amap_np = res['anomaly_map'].squeeze().numpy()
+                mask_binary = (mask_np > 0.5).astype(int)
+                
+                # Flatten the 2D arrays to 1D for sklearn compatibility
+                gt_list_px.extend(mask_binary.ravel())
+                pr_list_px.extend(amap_np.ravel())
+                
+                # AUPRO is evaluated only on images containing actual anomalies
+                if res['label'] == 1:
+                    pro_score = compute_pro(mask_binary[np.newaxis, :, :], amap_np[np.newaxis, :, :])
+                    aupro_list.append(pro_score)
+                    
+        # Convert lists to NumPy arrays
+        gt_px = np.array(gt_list_px)
+        pr_px = np.array(pr_list_px)
+        
+        # Calculate AUC and Average Precision metrics at pixel level
+        auroc_px = roc_auc_score(gt_px, pr_px)
+        ap_loc = average_precision_score(gt_px, pr_px)
+        aupro = np.mean(aupro_list) if len(aupro_list) > 0 else 0.0
+
+    # ---------------------------------------------------------
+    # PRINT EVALUATION REPORT
+    # ---------------------------------------------------------
+    print("=" * 50)
     print(" EVALUATION METRICS REPORT ")
-    print("=" * 40)
-    print(f"Optimal Threshold (RAW): {best_threshold_raw:.4f}")
-    print(f"AUROC:             {auroc:.4f}")
-    print(f"Accuracy:          {accuracy_score(y_true, y_pred):.4f}")
-    print(f"F1-Score:          {f1_score(y_true, y_pred):.4f}")
-    print(f"Precision:         {precision_score(y_true, y_pred):.4f}")
-    print(f"Recall:            {recall_score(y_true, y_pred):.4f}")
-    print("-" * 40)
+    print("=" * 50)
+    
+    print("--- SAMPLE LEVEL (Image Classification) ---")
+    print(f"Optimal Threshold: {best_threshold_raw:.4f}")
+    print(f"AUROC:             {auroc_sp:.4f}")
+    print(f"Accuracy:          {acc_sp:.4f}")
+    print(f"F1-Score:          {f1_sp:.4f}")
+    print(f"Precision:         {prec_sp:.4f}")
+    print(f"Recall:            {rec_sp:.4f}")
     print("Confusion Matrix (TN, FP | FN, TP):")
     print(cm)
-    print("=" * 40)
+    
+    if args.seg == 1:
+        print("\n--- PIXEL LEVEL (Defect Localization) ---")
+        print(f"AUPRO:             {aupro:.4f}")
+        print(f"AP-loc:            {ap_loc:.4f}")
+        print(f"Pixel AUROC:       {auroc_px:.4f}")
+    print("=" * 50)
 
     print("\nPhase 2/2: Saving visualizations categorized by Confusion Matrix...")
     for res in results_memory:

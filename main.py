@@ -265,14 +265,16 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 if vis == 1:
                     evaluation_visualization(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
                 # This part calculates the basic results and saves the results of the current epoch.
-                auroc_px, auroc_sp, aupro_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
-                print('Pixel Auroc: {:.3f}, Sample Auroc: {:.3f}, Pixel Aupro: {:.3}'.format(auroc_px, auroc_sp, aupro_px))
+                auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
+                
+                print(f'Pixel AUROC: {auroc_px:.3f}, Sample AUROC: {auroc_sp:.3f}, AUPRO: {aupro:.3f}')
+                print(f'AP-loc: {ap_loc:.3f}, F1-Score: {f1:.3f}, Precision: {prec:.3f}, Recall: {rec:.3f}')
 
 
                 # Update AUROC and AUPRO lists
                 max_auc.append(auroc_px)
                 max_auc_epoch.append(epoch + 1)
-                max_pr.append(aupro_px)
+                max_pr.append(aupro)
                 max_pr_epoch.append(epoch + 1)
 
 
