@@ -74,26 +74,41 @@ def apply_dynamic_crop_gpu(images, masks=None, padding=30):
         return torch.stack(cropped_imgs), torch.stack(cropped_masks)
     return torch.stack(cropped_imgs)
 
-# Calculate anomaly score map
+# Calculate anomaly score map (Optimized for GPU)
 def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
+    # Get the device dynamically from the input tensors
+    device = fs_list[0].device
+    
+    # Initialize the base anomaly map directly on the GPU
     if amap_mode == 'mul':
-        anomaly_map = np.ones([out_size, out_size])  # Initialize anomaly map
+        anomaly_map = torch.ones((1, 1, out_size, out_size), device=device)
     else:
-        anomaly_map = np.zeros([out_size, out_size])
+        anomaly_map = torch.zeros((1, 1, out_size, out_size), device=device)
+        
     a_map_list = []
+    
     for i in range(len(ft_list)):  # Iterate over anomaly maps
         fs = fs_list[i]
         ft = ft_list[i]
-        a_map = 1 - F.cosine_similarity(fs, ft)  # Compute cosine similarity between feature maps
-        a_map = torch.unsqueeze(a_map, dim=1)  # Unsqueeze to add an additional dimension
-        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=True)  # Upsample to output size
-        a_map = a_map[0, 0, :, :].to('cpu').detach().numpy()
-        a_map_list.append(a_map)
+        
+        # Compute cosine similarity on GPU
+        a_map = 1 - F.cosine_similarity(fs, ft, dim=1) 
+        a_map = torch.unsqueeze(a_map, dim=1)  # Shape: (B, 1, H, W)
+        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=True) 
+        
+        # Perform accumulation (multiply or add) directly on GPU
         if amap_mode == 'mul':
-            anomaly_map *= a_map  # Multiply anomaly maps
+            anomaly_map *= a_map
         else:
-            anomaly_map += a_map  # Sum anomaly maps
-    return anomaly_map, a_map_list  # Return final anomaly map and list of maps
+            anomaly_map += a_map
+            
+        # Store individual maps on CPU only if needed for return list
+        a_map_list.append(a_map.squeeze().cpu().detach().numpy())
+        
+    # Move the final combined map to CPU ONCE at the very end
+    final_anomaly_map = anomaly_map.squeeze().cpu().detach().numpy()
+    
+    return final_anomaly_map, a_map_list
 
 # Visualize anomaly map over image
 def show_cam_on_image(img, anomaly_map):
