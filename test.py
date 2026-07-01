@@ -129,13 +129,13 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     assert set(masks.flatten()) == {0, 1}, "set(masks.flatten()) must be {0, 1}"
     assert isinstance(num_th, int), "type(num_th) must be int"
 
-    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
     binary_amaps = np.zeros_like(amaps, dtype=bool)
 
     min_th = amaps.min()
     max_th = amaps.max()
     delta = (max_th - min_th) / num_th
 
+    metrics_records = []
     for th in np.arange(min_th, max_th, delta):
         binary_amaps[amaps <= th] = 0
         binary_amaps[amaps > th] = 1
@@ -152,8 +152,9 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
         fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
         fpr = fp_pixels / inverse_masks.sum()
 
-        df = pd.concat([df,pd.DataFrame({"pro": [mean(pros)], "fpr": [fpr], "threshold": [th]})], ignore_index=True)
+        metrics_records.append({"pro": np.mean(pros), "fpr": fpr, "threshold": th})
 
+    df = pd.DataFrame(metrics_records)
     df = df[df["fpr"] < 0.3]
     df["fpr"] = df["fpr"] / df["fpr"].max()
 
