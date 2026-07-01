@@ -15,7 +15,6 @@ from skimage import measure
 import pandas as pd
 from numpy import ndarray
 from statistics import mean
-from scipy.ndimage import gaussian_filter
 from sklearn import manifold
 from matplotlib.ticker import NullFormatter
 from scipy.spatial.distance import pdist
@@ -105,6 +104,16 @@ def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
         # Store individual maps on CPU only if needed for return list
         a_map_list.append(a_map.squeeze().cpu().detach().numpy())
         
+    kernel_size = 15
+    sigma = 4
+    x = torch.arange(kernel_size, device=device).float() - kernel_size // 2
+    gauss = torch.exp(-x**2 / (2 * sigma**2))
+    kernel = (gauss[:, None] * gauss[None, :])
+    kernel = (kernel / kernel.sum()).view(1, 1, kernel_size, kernel_size)
+    
+    # Pad the tensor to maintain the original spatial dimensions
+    anomaly_map = F.conv2d(anomaly_map, kernel, padding=kernel_size//2)
+
     # Move the final combined map to CPU ONCE at the very end
     final_anomaly_map = anomaly_map.squeeze().cpu().detach().numpy()
     
@@ -203,7 +212,6 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
             
             # Calculate final anomaly map
             anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian smoothing
 
             # Add sample-level labels
             gt_list_sp.append(label.numpy()[0]) 
@@ -240,7 +248,6 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, prin
             outputs = decoder(bn(inputs), inputs[0:3], res)  
 
             anomaly_map, amap_list = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')  # Generate anomaly map
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian filter
             ano_map = min_max_norm(anomaly_map)  # Normalize data
 
             ano_map = cvt2heatmap(255-ano_map*255)  # Convert to heatmap
@@ -294,7 +301,7 @@ def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, devic
             outputs = decoder(bn(inputs), inputs[0:3], res)  
 
             anomaly_map, amap_list = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')  # Generate anomaly map
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian filter
+            
             ano_map = min_max_norm(anomaly_map)  # Normalize data
 
             ano_map = cvt2heatmap(255-ano_map*255)  # Convert to heatmap
@@ -430,7 +437,7 @@ def evaluation_visA(encoder, bn, decoder, res, dataloader, device, img_path):
             outputs = decoder(bn(inputs), inputs[0:3], res) 
             # Compute anomaly maps using encoder's first three outputs and decoder's outputs
             anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)  # Apply Gaussian filter
+            
 
             gt[gt > 0.5] = 1
             gt[gt <= 0.5] = 0
