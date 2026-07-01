@@ -253,8 +253,14 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, prin
                 os.mkdir(img_path)
 
             # Save image
-            file_name = os.path.basename(ip[0])
-            plt.savefig(os.path.join(img_path, file_name))
+            original_name = os.path.basename(ip[0])
+            
+            # Split the name from its extension and append '.png'
+            name_without_ext = os.path.splitext(original_name)[0]
+            file_name_png = name_without_ext + '.png'
+            
+            # Save safely as a PNG file
+            plt.savefig(os.path.join(img_path, file_name_png))
 
             count += 1
 
