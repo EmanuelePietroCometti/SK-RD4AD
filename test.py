@@ -396,6 +396,14 @@ def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
     auroc_px = round(roc_auc_score(gt_px, pr_px), 3)
     ap_loc = round(average_precision_score(gt_px, pr_px), 3)
     aupro = round(np.mean(aupro_list), 3) if len(aupro_list) > 0 else 0.0
+
+    precisions_px, recalls_px, thresholds_px = precision_recall_curve(gt_px, pr_px)
+    f1_scores_px = (2 * precisions_px * recalls_px) / (precisions_px + recalls_px + 1e-10)
+    best_idx_px = min(np.argmax(f1_scores_px), len(thresholds_px) - 1)
+    best_threshold_px = thresholds_px[best_idx_px]
+    
+    pr_px_binary = (pr_px >= best_threshold_px).astype(int)
+    optimal_f1_px = round(f1_score(gt_px, pr_px_binary), 3)
     
     # ---------------------------------------------------------
     # SAMPLE-LEVEL METRICS (Image Classification)
@@ -417,7 +425,7 @@ def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
     optimal_prec_sp = round(precision_score(gt_sp, pr_sp_binary), 3)
     optimal_rec_sp = round(recall_score(gt_sp, pr_sp_binary), 3)
     
-    return auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp
+    return auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp, optimal_f1_px
 
 
 # Evaluation with segmentation, very time-consuming
