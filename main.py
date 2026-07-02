@@ -265,10 +265,10 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 if vis == 1:
                     evaluation_visualization(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
                 # This part calculates the basic results and saves the results of the current epoch.
-                auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px= evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
+                auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
                 
                 print(f'Pixel AUROC: {auroc_px:.3f}, Sample AUROC: {auroc_sp:.3f}, AUPRO: {aupro:.3f}')
-                print(f'AP-loc: {ap_loc:.3f}, F1-Score: {f1:.3f}, Precision: {prec:.3f}, Recall: {rec:.3f}')
+                print(f'AP-loc: {ap_loc:.3f}, F1-Score: {f1:.3f}, Precision: {prec:.3f}, Recall: {rec:.3f}, F1-px: {f1_px:.3f}')
 
 
                 # Update AUROC and AUPRO lists
@@ -290,8 +290,11 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 if current_avg_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
                     torch.save({'bn': bn.state_dict(),'decoder': decoder.state_dict()}, ckp_path + str(epoch+1) + str(seed) + 'sample_auc=' + str(auroc_sp) + '.pth')
+                    
                     best_avg_score = current_avg_score
-    return auroc_sp
+                    
+                    best_metrics = (auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px)
+    return best_metrics
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
