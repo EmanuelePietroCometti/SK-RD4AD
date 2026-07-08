@@ -75,14 +75,15 @@ def apply_dynamic_crop_gpu(images, masks=None, padding=30):
 
 # Calculate anomaly score map (Optimized for GPU)
 def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
-    # Get the device dynamically from the input tensors
+    # Get the device and batch size dynamically from the input tensors
     device = fs_list[0].device
-    
+    batch = fs_list[0].shape[0]
+
     # Initialize the base anomaly map directly on the GPU
     if amap_mode == 'mul':
-        anomaly_map = torch.ones((1, 1, out_size, out_size), device=device)
+        anomaly_map = torch.ones((batch, 1, out_size, out_size), device=device)
     else:
-        anomaly_map = torch.zeros((1, 1, out_size, out_size), device=device)
+        anomaly_map = torch.zeros((batch, 1, out_size, out_size), device=device)
         
     a_map_list = []
     
@@ -196,33 +197,31 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
     pr_list_sp = [] 
 
 
+    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
     with torch.no_grad():
         for (img, label, _) in dataloader:
-            img = img.to(device) 
-            
+            img = img.to(device)
+
             # Denormalize, Crop, Renormalize
-            mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
             img = (img * std_t + mean_t).clamp(0, 1)
             img = apply_dynamic_crop_gpu(img)
             img = (img - mean_t) / std_t
-            
+
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)
-            
-            # Calculate final anomaly map
+
+            # Calculate final anomaly map (supports any batch size)
             anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
+            anomaly_map = anomaly_map.reshape(img.shape[0], -1)
 
             # Add sample-level labels
-            gt_list_sp.append(label.numpy()[0]) 
+            gt_list_sp.extend(label.numpy().tolist())
 
-            # Calculate sample-level predictions
-            pre_map = np.flipud(np.sort(anomaly_map.flatten()))
-            pre = 0
-            for x in range(score_num):
-                pre +=pre_map[x]
-            pre = pre/score_num
-            pr_list_sp.append(round(pre,3))
+            # Sample-level prediction: mean of the top-`score_num` pixels per image
+            top_scores = np.sort(anomaly_map, axis=1)[:, -score_num:].mean(axis=1)
+            pr_list_sp.extend(np.round(top_scores, 3).tolist())
 
         if print_canshu == 1:
             print(gt_list_sp, pr_list_sp)  # Print intermediate results

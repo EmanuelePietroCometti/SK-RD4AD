@@ -147,13 +147,13 @@ def evaluate_and_save_maps(args):
         encoder, bn = wide_resnet50_2(pretrained=True)
         decoder = de_wide_resnet50_2(pretrained=False)
     elif args.net == 'res18':
-        encoder = resnet18(pretrained=True)
+        encoder, bn = resnet18(pretrained=True)
         decoder = de_resnet18(pretrained=False)
     elif args.net == 'res34':
-        encoder = resnet34(pretrained=True)
+        encoder, bn = resnet34(pretrained=True)
         decoder = de_resnet34(pretrained=False)
     elif args.net == 'res50':
-        encoder = resnet50(pretrained=True)
+        encoder, bn = resnet50(pretrained=True)
         decoder = de_resnet50(pretrained=False)
     
     encoder = encoder.to(device)

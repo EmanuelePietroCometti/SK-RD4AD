@@ -41,20 +41,15 @@ def loss_function(a, b, L2):  # Input two tensor arrays
     if L2 == 2:
         l2_loss = torch.nn.MSELoss()
         for item in range(len(a)):
-             loss += 0.5 * torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))       
+             loss += 0.5 * torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
              loss += 0.5 * torch.mean(1-cos_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
-    loss2 = loss_function_2(a,b)
 
     # Use L2 loss
     if L2 == 1:
         l2_loss = torch.nn.MSELoss()
         for item in range(len(a)):
-             loss += torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))       
-    loss2 = loss_function_2(a,b)
-    #print(loss)
-    #print(loss2) 
-    #sys.exit()
-    return loss,loss2
+             loss += torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
+    return loss
 
 # Try to calculate inter-group consistency loss
 def loss_function_2(a, b):  # Input two tensor arrays
@@ -108,21 +103,24 @@ def train(epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, s
         decoder = de_wide_resnet50_2(pretrained=False)  # Decoder, inverse structure of encoder
         decoder = decoder.to(device)
     if net == 'res18':
-        encoder = resnet18(pretrained=True)  # Encoder
+        encoder, bn = resnet18(pretrained=True)  # Encoder and bottleneck
         encoder = encoder.to(device)
-        encoder.eval()  # Fix encoder model parameters    
+        bn = bn.to(device)
+        encoder.eval()  # Fix encoder model parameters
         decoder = de_resnet18(pretrained=False)  # Decoder, inverse structure of encoder
         decoder = decoder.to(device)
     if net == 'res34':
-        encoder = resnet34(pretrained=True)  # Encoder
+        encoder, bn = resnet34(pretrained=True)  # Encoder and bottleneck
         encoder = encoder.to(device)
-        encoder.eval()  # Fix encoder model parameters    
+        bn = bn.to(device)
+        encoder.eval()  # Fix encoder model parameters
         decoder = de_resnet34(pretrained=False)  # Decoder, inverse structure of encoder
         decoder = decoder.to(device)
     if net == 'res50':
-        encoder = resnet50(pretrained=True)  # Encoder
+        encoder, bn = resnet50(pretrained=True)  # Encoder and bottleneck
         encoder = encoder.to(device)
-        encoder.eval()  # Fix encoder model parameters    
+        bn = bn.to(device)
+        encoder.eval()  # Fix encoder model parameters
         decoder = de_resnet50(pretrained=False)  # Decoder, inverse structure of encoder
         decoder = decoder.to(device)
 
@@ -140,15 +138,16 @@ def train(epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, s
         bn.train()
         loss_list = []
         for img, label in train_dataloader:
-            img = img.to(device) 
-            inputs = encoder(img)
-            outputs = decoder(bn(inputs), inputs[0:3], res)  
+            img = img.to(device)
+            # Frozen encoder: no autograd graph needed
+            with torch.no_grad():
+                inputs = encoder(img)
+            outputs = decoder(bn(inputs), inputs[0:3], res)
 
-            # Choose loss function  
-            if layerloss == 0:
-                loss = loss_function(inputs[0:3], outputs, L2)[0] 
+            # Choose loss function
+            loss = loss_function(inputs[0:3], outputs, L2)
             if layerloss == 1:
-                loss = loss_function(inputs[0:3], outputs, L2)[0] + rate * loss_function(inputs[0:3], outputs, L2)[1]
+                loss = loss + rate * loss_function_2(inputs[0:3], outputs)
 
             optimizer.zero_grad() 
             loss.backward()

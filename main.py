@@ -46,7 +46,9 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# Loss function, can be used for ablation studies
+# Loss function, can be used for ablation studies.
+# Returns only the main distillation loss; the inter-group consistency loss
+# (loss_function_2) is computed separately, only when layerloss == 1.
 def loss_function(a, b, L2):  # Input two tensor arrays
     cos_loss = torch.nn.CosineSimilarity()
     #print(a[0].size())  # a[0] = [16,256,64,64]
@@ -57,27 +59,21 @@ def loss_function(a, b, L2):  # Input two tensor arrays
     # Use cosine loss
     if L2 == 0:
         for item in range(len(a)):  # For each tensor in a
-            #print(torch.mean((1-cos_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))))
             loss += torch.mean(1-cos_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
 
     # Use L2 loss + cosine loss
     if L2 == 2:
         l2_loss = torch.nn.MSELoss()
         for item in range(len(a)):
-             loss += 0.5 * torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))       
+             loss += 0.5 * torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
              loss += 0.5 * torch.mean(1-cos_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
-    loss2 = loss_function_2(a,b)
 
     # Use L2 loss
     if L2 == 1:
         l2_loss = torch.nn.MSELoss()
         for item in range(len(a)):
-             loss += torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))       
-    loss2 = loss_function_2(a,b)
-    #print(loss)
-    #print(loss2) 
-    #sys.exit()
-    return loss,loss2
+             loss += torch.mean(l2_loss(a[item].view(a[item].shape[0],-1), b[item].view(b[item].shape[0],-1)))
+    return loss
 
 # Try to calculate inter-group consistency loss
 def loss_function_2(a, b):  # Input two tensor arrays
@@ -127,8 +123,9 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
     # Whether to use segmentation
     if seg == 0:  
-        test_data = MVTecDataset_no_seg(root=test_path, transform=data_transforms, phase="test") 
-        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=8, pin_memory=True)
+        test_data = MVTecDataset_no_seg(root=test_path, transform=data_transforms, phase="test")
+        # evaluation_me is vectorized: batching the test set speeds up evaluation
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
     if seg == 1:
         test_data = MVTecDataset(root=test_path, transform=data_transforms, gt_transform=gt_transform, phase="test") 
         test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=8, pin_memory=True)
@@ -173,6 +170,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     max_pr = []
     max_pr_epoch = []
     best_avg_score = 0
+    best_metrics = None  # stays None if no evaluation ever improves the score
 
     # Define v2 pipeline (executed directly on GPU tensors)
     gpu_transforms = v2.Compose([
@@ -205,8 +203,8 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             # Apply Dynamic Crop (Always active to normalize object scale)
             img = apply_dynamic_crop_gpu(img)
 
-            # Apply Equalization (50% probability)
-            if torch.rand(1, device=device).item() < 0.5:
+            # Apply Equalization (50% probability) — CPU rng, avoids a GPU sync per batch
+            if random.random() < 0.5:
                 img_uint8 = (img * 255.0).to(torch.uint8)
                 img = F_v2.equalize(img_uint8).to(torch.float32) / 255.0
 
@@ -217,14 +215,16 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             img = (img - mean_t) / std_t
             # ==========================================
 
-            inputs = encoder(img)
+            # The encoder is frozen: skip autograd graph construction for it
+            # (saves memory and compute; gradients only flow through bn/decoder)
+            with torch.no_grad():
+                inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)
 
-            # Choose loss function  
-            if layerloss == 0:
-                loss = loss_function(inputs[0:3], outputs, L2)[0] 
+            # Choose loss function
+            loss = loss_function(inputs[0:3], outputs, L2)
             if layerloss == 1:
-                loss = loss_function(inputs[0:3], outputs, L2)[0] + rate * loss_function(inputs[0:3], outputs, L2)[1]
+                loss = loss + rate * loss_function_2(inputs[0:3], outputs)
 
             optimizer.zero_grad() 
             loss.backward()
@@ -254,6 +254,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
                     torch.save({'bn': bn.state_dict(),'decoder': decoder.state_dict()}, ckp_path + str(epoch+1) + str(seed) + 'sample_auc=' + str(auroc_sp) + '.pth')
                     best_avg_score = current_auroc_score
+                    best_metrics = (auroc_sp,)
                
                 if vis == 1:  # Visualization output when no mask
                     evaluation_visualization_no_seg(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
