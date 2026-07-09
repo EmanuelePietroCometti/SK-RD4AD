@@ -96,6 +96,35 @@ def build_model(checkpoint_path: str | None, device: str) -> RD4ADPure:
     return model
 
 
+# Embedded in the .onnx file so the inference runtime (inference_simulation) can
+# auto-configure itself instead of relying on CLI flags the operator has to
+# remember. score_source="map_max_blurred" tells the runtime the graph's
+# anomaly_score output is NOT the number to threshold on for this architecture
+# (unlike SuperSimpleNet's dedicated classification head) - eval.py's calibrated
+# threshold is computed on max(cv2.GaussianBlur(map, (15,15), sigma=0)), and the
+# graph deliberately omits that blur (see module docstring), so the runtime must
+# reproduce it host-side before scoring. Getting this wrong silently produces a
+# score the ONNX graph did emit, just not the one any threshold was ever
+# calibrated against - a much harder bug to notice than a crash.
+EXPORT_METADATA = {
+    "anomaly_export_contract": "1.0",
+    "architecture": "sk_rd4ad",
+    "score_source": "map_max_blurred",
+    "blur_kernel_size": "15",
+    "blur_sigma": "0.0",   # 0.0 => let cv2.GaussianBlur derive sigma from kernel_size (matches eval.py)
+    "verified": "true",    # confirmed against eval.py's compute_image_anomaly_score_and_map
+}
+
+
+def _write_metadata(onnx_path: Path) -> None:
+    import onnx
+    m = onnx.load(str(onnx_path))
+    for k, v in EXPORT_METADATA.items():
+        entry = m.metadata_props.add()
+        entry.key, entry.value = k, v
+    onnx.save(m, str(onnx_path))
+
+
 def export_fp32(model: nn.Module, onnx_path: Path, device: str):
     dummy = torch.randn(2, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32, device=device)
     dynamic_axes = {
@@ -112,6 +141,7 @@ def export_fp32(model: nn.Module, onnx_path: Path, device: str):
         )
     import onnx
     onnx.checker.check_model(str(onnx_path))
+    _write_metadata(onnx_path)
 
 
 def verify(model, onnx_path, device, atol=1e-3, rtol=1e-3):
@@ -172,7 +202,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if args.self_test:
-        if args.checkpoint is not None:
+        # With --self_test there is no checkpoint to speak of, so a single
+        # positional argument means "output path", not "checkpoint" (argparse
+        # otherwise binds it to the first positional declared, silently dropping
+        # it since self_test never reads args.checkpoint anyway).
+        if args.checkpoint is not None and args.output == "sk_rd4ad_selftest.onnx":
+            args.output = args.checkpoint
+        elif args.checkpoint is not None:
             print("[!] --self_test uses RANDOM weights; the given checkpoint is ignored.")
         ckpt = None
     else:
