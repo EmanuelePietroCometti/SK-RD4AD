@@ -114,47 +114,84 @@ def export_fp32(model: nn.Module, onnx_path: Path, device: str):
     onnx.checker.check_model(str(onnx_path))
 
 
-def verify(model, onnx_path, device, atol=1e-5):
+def verify(model, onnx_path, device, atol=1e-3, rtol=1e-3):
+    # PyTorch and ONNX Runtime use different conv/reduction kernels, so bit-exact
+    # parity is impossible on a network this deep; expect ~1e-4 drift on the raw
+    # map. Tolerances are set to catch real bugs (wrong op, transposed weights)
+    # while allowing normal floating-point divergence.
     import onnxruntime as ort
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     rng = np.random.default_rng(0)
-    print("\n--- PyTorch vs ONNX parity (atol=1e-5) ---")
+    print(f"\n--- PyTorch vs ONNX parity (atol={atol:g}, rtol={rtol:g}) ---")
     for batch in (1, 4):
         x = rng.standard_normal((batch, 3, IMG_SIZE, IMG_SIZE)).astype(np.float32)
         with torch.no_grad():
             tm, ts = model(torch.from_numpy(x).to(device))
         om, os_ = sess.run(OUTPUT_NAMES, {INPUT_NAMES[0]: x})
-        np.testing.assert_allclose(om, tm.cpu().numpy(), atol=atol, rtol=0,
+        np.testing.assert_allclose(om, tm.cpu().numpy(), atol=atol, rtol=rtol,
                                    err_msg=f"anomaly_map mismatch (batch={batch})")
-        np.testing.assert_allclose(os_, ts.cpu().numpy(), atol=atol, rtol=0,
+        np.testing.assert_allclose(os_, ts.cpu().numpy(), atol=atol, rtol=rtol,
                                    err_msg=f"anomaly_score mismatch (batch={batch})")
         print(f"  batch={batch}: map |Δ|max={np.abs(om-tm.cpu().numpy()).max():.2e}  "
               f"score |Δ|max={np.abs(os_-ts.cpu().numpy()).max():.2e}  OK")
-    print("[PASS] Exact mathematical parity confirmed.")
+    print("[PASS] Numerical parity within tolerance confirmed.")
+
+
+def resolve_output_path(output: str, checkpoint: str | None) -> Path:
+    """Turn the ``output`` argument into a concrete ``.onnx`` file path.
+
+    Accepts either a full file path (``.../model.onnx``) or a directory. A
+    directory is detected if the path already exists as one, or has no ``.onnx``
+    suffix (so ``exports`` or ``exports/`` both mean "put the file in here"); in
+    that case the filename is derived from the checkpoint stem. This avoids the
+    ``PermissionError``/``IsADirectoryError`` from handing torch.onnx.export a
+    directory to open for writing.
+    """
+    out = Path(output)
+    is_dir = out.is_dir() or out.suffix.lower() != ".onnx"
+    if is_dir:
+        stem = Path(checkpoint).stem if checkpoint else "sk_rd4ad_selftest"
+        out = out / f"{stem}.onnx"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("checkpoint", nargs="?", default=None)
-    p.add_argument("output", nargs="?", default="sk_rd4ad_selftest.onnx")
-    p.add_argument("--self_test", action="store_true")
+    p.add_argument("checkpoint", nargs="?", default=None,
+                   help="Path to the .pth checkpoint ('bn' + 'decoder'). Omit with --self_test.")
+    p.add_argument("output", nargs="?", default="sk_rd4ad_selftest.onnx",
+                   help="Output .onnx file, or a directory to place it in.")
+    p.add_argument("--self_test", action="store_true",
+                   help="Export with RANDOM weights (ignores checkpoint) and run parity.")
+    p.add_argument("--no_verify", action="store_true",
+                   help="Skip the PyTorch<->ONNX parity check after a real export.")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt = None if args.self_test else args.checkpoint
-    if ckpt is not None and not Path(ckpt).is_file():
-        sys.exit(f"Checkpoint not found: {ckpt}")
+
+    if args.self_test:
+        if args.checkpoint is not None:
+            print("[!] --self_test uses RANDOM weights; the given checkpoint is ignored.")
+        ckpt = None
+    else:
+        ckpt = args.checkpoint
+        if ckpt is None:
+            sys.exit("ERROR: provide a checkpoint path, or pass --self_test for a random-weight export.")
+        if not Path(ckpt).is_file():
+            sys.exit(f"Checkpoint not found: {ckpt}")
 
     model = build_model(ckpt, device)
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = resolve_output_path(args.output, ckpt)
 
     print(f"\n--- Exporting SK-RD4AD (pure graph) -> {out_path} ---")
     export_fp32(model, out_path, device)
     print(f"[OK] fp32 export: {out_path}")
 
-    if args.self_test:
+    # Verify for BOTH self-test and real exports (parity holds regardless of the
+    # weights); only skip if the user explicitly opts out.
+    if args.self_test or not args.no_verify:
         verify(model, out_path, device)
 
 
