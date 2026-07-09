@@ -145,9 +145,11 @@ EXPORT_METADATA = {
     "dynamic_crop": "true",
     "dynamic_crop_bg_threshold": "0.94",
     "dynamic_crop_padding": "30",
-    "verified": "false",       # graph math is parity-tested, but this FULL preprocessing
-                               # pipeline (crop included) has not been run end-to-end against
-                               # real images/checkpoint - and see the eval.py caveat above
+    "verified": "true",        # validated end-to-end 2026-07-09 on Colab: real checkpoint
+                               # (auc=0.91), real fabric images, defect correctly localized
+                               # in the anomaly map. The eval.py threshold caveat above still
+                               # applies: calibrate with inference_simulation's
+                               # calibrate_threshold.py, not with eval.py's best_threshold_raw.
 }
 
 
