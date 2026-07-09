@@ -106,26 +106,57 @@ def build_model(checkpoint_path: str | None, device: str) -> RD4ADPure:
 # reproduce it host-side before scoring. Getting this wrong silently produces a
 # score the ONNX graph did emit, just not the one any threshold was ever
 # calibrated against - a much harder bug to notice than a crash.
+#
+# dynamic_crop=true: main.py's training loop ALWAYS applies
+# apply_dynamic_crop_gpu (test.py) before the encoder - it crops to the
+# bounding box of non-background pixels and rescales it to fill the frame, to
+# normalize object scale. test.py's evaluation_me/evaluation (used for the
+# training loop's own AUROC) apply it too. inference_simulation must replicate
+# it or the model receives a different object scale/framing than it was
+# trained on - uniformly bad reconstruction (raw scores stuck near their
+# maximum, ~0.999, for every image regardless of content) is the exact
+# signature of this mismatch.
+#
+# IMPORTANT CAVEAT: eval.py - the script that computes 'best_threshold_raw' -
+# does NOT apply this crop (it feeds the dataloader's image straight to the
+# encoder), unlike test.py. This is an inconsistency in the training repo
+# itself, not introduced by this export. Enabling the crop here (matching how
+# the network was actually TRAINED, i.e. test.py's convention) means a
+# best_threshold_raw obtained from eval.py may no longer be the right
+# threshold, since eval.py's score distribution was computed WITHOUT cropping.
+# Recompute the threshold with a crop-consistent evaluation before trusting
+# production verdicts.
 EXPORT_METADATA = {
     "anomaly_export_contract": "1.0",
     "architecture": "sk_rd4ad",
     "score_source": "map_max_blurred",
     "blur_kernel_size": "15",
-    "blur_sigma": "0.0",   # 0.0 => let cv2.GaussianBlur derive sigma from kernel_size (matches eval.py)
-    "verified": "true",    # confirmed against eval.py's compute_image_anomaly_score_and_map
+    "blur_sigma": "0.0",       # 0.0 => let cv2.GaussianBlur derive sigma from kernel_size (matches eval.py)
+    "dynamic_crop": "true",
+    "dynamic_crop_bg_threshold": "0.94",
+    "dynamic_crop_padding": "30",
+    "verified": "false",       # graph math is parity-tested, but this FULL preprocessing
+                               # pipeline (crop included) has not been run end-to-end against
+                               # real images/checkpoint - and see the eval.py caveat above
 }
 
 
-def _write_metadata(onnx_path: Path) -> None:
+def _write_metadata(onnx_path: Path, weights_source: str) -> None:
+    """weights_source: "checkpoint:<filename>" for real exports, or
+    "random_self_test" for --self_test exports. The inference runtime refuses
+    to score with a random_self_test model: with a random decoder the cosine
+    distance saturates (~uniform map, near-constant max score for EVERY image
+    -> all-red heatmaps, "anomaly score = 1"), which looks like a subtle
+    pipeline bug instead of what it is - a model with no trained weights."""
     import onnx
     m = onnx.load(str(onnx_path))
-    for k, v in EXPORT_METADATA.items():
+    for k, v in {**EXPORT_METADATA, "weights_source": weights_source}.items():
         entry = m.metadata_props.add()
         entry.key, entry.value = k, v
     onnx.save(m, str(onnx_path))
 
 
-def export_fp32(model: nn.Module, onnx_path: Path, device: str):
+def export_fp32(model: nn.Module, onnx_path: Path, device: str, weights_source: str):
     dummy = torch.randn(2, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32, device=device)
     dynamic_axes = {
         "input_tensor": {0: "batch"},
@@ -141,7 +172,7 @@ def export_fp32(model: nn.Module, onnx_path: Path, device: str):
         )
     import onnx
     onnx.checker.check_model(str(onnx_path))
-    _write_metadata(onnx_path)
+    _write_metadata(onnx_path, weights_source)
 
 
 def verify(model, onnx_path, device, atol=1e-3, rtol=1e-3):
@@ -194,7 +225,9 @@ def main():
     p.add_argument("output", nargs="?", default="sk_rd4ad_selftest.onnx",
                    help="Output .onnx file, or a directory to place it in.")
     p.add_argument("--self_test", action="store_true",
-                   help="Export with RANDOM weights (ignores checkpoint) and run parity.")
+                   help="Export with RANDOM weights to test the export pipeline itself "
+                        "(NOT usable for real inference: a random decoder saturates the "
+                        "anomaly map at ~1 for every image). Incompatible with a checkpoint.")
     p.add_argument("--no_verify", action="store_true",
                    help="Skip the PyTorch<->ONNX parity check after a real export.")
     args = p.parse_args()
@@ -204,12 +237,26 @@ def main():
     if args.self_test:
         # With --self_test there is no checkpoint to speak of, so a single
         # positional argument means "output path", not "checkpoint" (argparse
-        # otherwise binds it to the first positional declared, silently dropping
-        # it since self_test never reads args.checkpoint anyway).
+        # otherwise binds it to the first positional declared).
         if args.checkpoint is not None and args.output == "sk_rd4ad_selftest.onnx":
             args.output = args.checkpoint
         elif args.checkpoint is not None:
-            print("[!] --self_test uses RANDOM weights; the given checkpoint is ignored.")
+            # A previous version only warned here and exported RANDOM weights
+            # anyway. That produced a production-looking .onnx whose decoder
+            # reconstructs nothing: anomaly map uniformly ~1 (all-red heatmap)
+            # and a near-constant max score for every image - symptoms that
+            # look like a pipeline bug rather than untrained weights. Refuse
+            # instead: the two options are mutually exclusive on purpose.
+            sys.exit(
+                "ERROR: --self_test and a checkpoint are mutually exclusive.\n"
+                "  - To export your TRAINED model:  python export_onnx_from_checkpoint.py "
+                "<checkpoint.pth> <output>\n"
+                "  - To test the export pipeline with random weights:  "
+                "python export_onnx_from_checkpoint.py --self_test <output>\n"
+                "A --self_test model must never be used for real inference: its random "
+                "decoder saturates the anomaly map (~1 everywhere, all-red heatmaps, "
+                "identical scores for every image)."
+            )
         ckpt = None
     else:
         ckpt = args.checkpoint
@@ -220,9 +267,10 @@ def main():
 
     model = build_model(ckpt, device)
     out_path = resolve_output_path(args.output, ckpt)
+    weights_source = f"checkpoint:{Path(ckpt).name}" if ckpt else "random_self_test"
 
-    print(f"\n--- Exporting SK-RD4AD (pure graph) -> {out_path} ---")
-    export_fp32(model, out_path, device)
+    print(f"\n--- Exporting SK-RD4AD (pure graph, weights: {weights_source}) -> {out_path} ---")
+    export_fp32(model, out_path, device, weights_source)
     print(f"[OK] fp32 export: {out_path}")
 
     # Verify for BOTH self-test and real exports (parity holds regardless of the
