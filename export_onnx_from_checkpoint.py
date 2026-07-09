@@ -42,7 +42,12 @@ import torch.nn.functional as F
 from model.resnet import wide_resnet50_2
 from model.de_resnet import de_wide_resnet50_2
 
-RES = 3
+# Default number-of-skip-connections parameter (main.py --res default). MUST
+# match the value the checkpoint was TRAINED with: it changes the decoder's
+# forward structure (which skip connections are added), so a mismatch produces
+# a graph that computes something the trained weights never saw - garbage
+# output with no error raised. Override with --res at export time.
+DEFAULT_RES = 3
 IMG_SIZE = 256
 OPSET = 17
 INPUT_NAMES = ["input_tensor"]
@@ -50,19 +55,24 @@ OUTPUT_NAMES = ["anomaly_map", "anomaly_score"]
 
 
 class RD4ADPure(nn.Module):
-    """Pure forward pass: normalized tensor in -> (raw anomaly_map, raw score)."""
+    """Pure forward pass: normalized tensor in -> (raw anomaly_map, raw score).
 
-    def __init__(self, encoder, bn, decoder):
+    ``res`` must equal the --res the checkpoint was trained with (it selects the
+    decoder's skip-connection structure; see DEFAULT_RES comment above).
+    """
+
+    def __init__(self, encoder, bn, decoder, res: int = DEFAULT_RES):
         super().__init__()
         self.encoder = encoder
         self.bn = bn
         self.decoder = decoder
+        self.res = res
         for p in self.parameters():
             p.requires_grad_(False)
 
     def forward(self, input_tensor: torch.Tensor):
         feats = self.encoder(input_tensor)
-        recon = self.decoder(self.bn(feats), feats[0:3], RES)
+        recon = self.decoder(self.bn(feats), feats[0:3], self.res)
 
         anomaly_map = None
         for a, b in zip(feats, recon):
@@ -79,7 +89,7 @@ class RD4ADPure(nn.Module):
         return anomaly_map, score
 
 
-def build_model(checkpoint_path: str | None, device: str) -> RD4ADPure:
+def build_model(checkpoint_path: str | None, device: str, res: int = DEFAULT_RES) -> RD4ADPure:
     # For --self_test we skip the pretrained download; parity does not need
     # trained weights (it compares the two graphs, not accuracy).
     encoder, bn = wide_resnet50_2(pretrained=checkpoint_path is not None)
@@ -92,7 +102,7 @@ def build_model(checkpoint_path: str | None, device: str) -> RD4ADPure:
         decoder.load_state_dict(ckpt["decoder"])
         bn.load_state_dict(ckpt["bn"])
 
-    model = RD4ADPure(encoder.eval(), bn.eval(), decoder.eval()).to(device).eval()
+    model = RD4ADPure(encoder.eval(), bn.eval(), decoder.eval(), res=res).to(device).eval()
     return model
 
 
@@ -141,22 +151,25 @@ EXPORT_METADATA = {
 }
 
 
-def _write_metadata(onnx_path: Path, weights_source: str) -> None:
+def _write_metadata(onnx_path: Path, weights_source: str, res: int) -> None:
     """weights_source: "checkpoint:<filename>" for real exports, or
     "random_self_test" for --self_test exports. The inference runtime refuses
     to score with a random_self_test model: with a random decoder the cosine
     distance saturates (~uniform map, near-constant max score for EVERY image
     -> all-red heatmaps, "anomaly score = 1"), which looks like a subtle
-    pipeline bug instead of what it is - a model with no trained weights."""
+    pipeline bug instead of what it is - a model with no trained weights.
+
+    res: the skip-connection setting baked into this graph; recorded so it is
+    always possible to check it against the training run's --res afterwards."""
     import onnx
     m = onnx.load(str(onnx_path))
-    for k, v in {**EXPORT_METADATA, "weights_source": weights_source}.items():
+    for k, v in {**EXPORT_METADATA, "weights_source": weights_source, "res": str(res)}.items():
         entry = m.metadata_props.add()
         entry.key, entry.value = k, v
     onnx.save(m, str(onnx_path))
 
 
-def export_fp32(model: nn.Module, onnx_path: Path, device: str, weights_source: str):
+def export_fp32(model: RD4ADPure, onnx_path: Path, device: str, weights_source: str):
     dummy = torch.randn(2, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32, device=device)
     dynamic_axes = {
         "input_tensor": {0: "batch"},
@@ -172,7 +185,7 @@ def export_fp32(model: nn.Module, onnx_path: Path, device: str, weights_source: 
         )
     import onnx
     onnx.checker.check_model(str(onnx_path))
-    _write_metadata(onnx_path, weights_source)
+    _write_metadata(onnx_path, weights_source, model.res)
 
 
 def verify(model, onnx_path, device, atol=1e-3, rtol=1e-3):
@@ -230,6 +243,10 @@ def main():
                         "anomaly map at ~1 for every image). Incompatible with a checkpoint.")
     p.add_argument("--no_verify", action="store_true",
                    help="Skip the PyTorch<->ONNX parity check after a real export.")
+    p.add_argument("--res", type=int, default=DEFAULT_RES, choices=[1, 2, 3],
+                   help="MUST match the --res used at TRAINING time (default: 3, the "
+                        "training default). Selects the decoder's skip-connection "
+                        "structure; a mismatch silently produces garbage output.")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -265,11 +282,11 @@ def main():
         if not Path(ckpt).is_file():
             sys.exit(f"Checkpoint not found: {ckpt}")
 
-    model = build_model(ckpt, device)
+    model = build_model(ckpt, device, res=args.res)
     out_path = resolve_output_path(args.output, ckpt)
     weights_source = f"checkpoint:{Path(ckpt).name}" if ckpt else "random_self_test"
 
-    print(f"\n--- Exporting SK-RD4AD (pure graph, weights: {weights_source}) -> {out_path} ---")
+    print(f"\n--- Exporting SK-RD4AD (pure graph, weights: {weights_source}, res={args.res}) -> {out_path} ---")
     export_fp32(model, out_path, device, weights_source)
     print(f"[OK] fp32 export: {out_path}")
 
