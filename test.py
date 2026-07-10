@@ -73,52 +73,54 @@ def apply_dynamic_crop_gpu(images, masks=None, padding=30):
         return torch.stack(cropped_imgs), torch.stack(cropped_masks)
     return torch.stack(cropped_imgs)
 
-# Calculate anomaly score map (Optimized for GPU)
-def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
-    # Get the device and batch size dynamically from the input tensors
-    device = fs_list[0].device
-    batch = fs_list[0].shape[0]
+# ---------------------------------------------------------------------------
+# CANONICAL ANOMALY-MAP DEFINITION — single source of truth for the whole repo.
+#
+# Pipeline: dynamic crop (on the DENORMALIZED [0,1] image, as in main.py's
+# training loop) -> sum of per-layer (1 - cosine similarity) maps, bilinearly
+# upsampled with align_corners=False -> Gaussian blur k=15, sigma=4, zero
+# padding -> image-level score = max of the BLURRED map.
+#
+# sigma=4 is the kernel evaluation_me/evaluation used to SELECT the best
+# checkpoint during training, so training AUROCs remain valid under this
+# definition. eval.py, export_onnx_from_checkpoint.py (which bakes this blur
+# into the graph), calibrate_threshold.py and the inference runtime must all
+# import/reproduce exactly this; do not redefine the kernel elsewhere.
+# ---------------------------------------------------------------------------
+GAUSS_KERNEL_SIZE = 15
+GAUSS_SIGMA = 4.0
 
-    # Initialize the base anomaly map directly on the GPU
-    if amap_mode == 'mul':
-        anomaly_map = torch.ones((batch, 1, out_size, out_size), device=device)
-    else:
-        anomaly_map = torch.zeros((batch, 1, out_size, out_size), device=device)
-        
-    a_map_list = []
-    
-    for i in range(len(ft_list)):  # Iterate over anomaly maps
-        fs = fs_list[i]
-        ft = ft_list[i]
-        
-        # Compute cosine similarity on GPU
-        a_map = 1 - F.cosine_similarity(fs, ft, dim=1) 
-        a_map = torch.unsqueeze(a_map, dim=1)  # Shape: (B, 1, H, W)
-        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=True) 
-        
-        # Perform accumulation (multiply or add) directly on GPU
-        if amap_mode == 'mul':
-            anomaly_map *= a_map
-        else:
-            anomaly_map += a_map
-            
-        # Store individual maps on CPU only if needed for return list
-        a_map_list.append(a_map.squeeze().cpu().detach().numpy())
-        
-    kernel_size = 15
-    sigma = 4
-    x = torch.arange(kernel_size, device=device).float() - kernel_size // 2
-    gauss = torch.exp(-x**2 / (2 * sigma**2))
-    kernel = (gauss[:, None] * gauss[None, :])
-    kernel = (kernel / kernel.sum()).view(1, 1, kernel_size, kernel_size)
-    
-    # Pad the tensor to maintain the original spatial dimensions
-    anomaly_map = F.conv2d(anomaly_map, kernel, padding=kernel_size//2)
+def get_gaussian_kernel(device):
+    x = torch.arange(GAUSS_KERNEL_SIZE, device=device).float() - GAUSS_KERNEL_SIZE // 2
+    gauss = torch.exp(-x**2 / (2 * GAUSS_SIGMA**2))
+    kernel = gauss[:, None] * gauss[None, :]
+    return (kernel / kernel.sum()).view(1, 1, GAUSS_KERNEL_SIZE, GAUSS_KERNEL_SIZE)
 
-    # Move the final combined map to CPU ONCE at the very end
-    final_anomaly_map = anomaly_map.squeeze().cpu().detach().numpy()
-    
-    return final_anomaly_map, a_map_list
+def compute_anomaly_map_torch(fs_list, ft_list, out_size):
+    """Canonical blurred anomaly map as a tensor [B, 1, out_size, out_size].
+
+    Returns (blurred_map, per_layer_unblurred_maps). Image-level score is
+    blurred_map.amax() over the spatial dims.
+    """
+    anomaly_map = None
+    layer_maps = []
+    for fs, ft in zip(fs_list, ft_list):
+        a_map = 1 - F.cosine_similarity(fs, ft, dim=1).unsqueeze(1)  # (B,1,h,w)
+        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=False)
+        layer_maps.append(a_map)
+        anomaly_map = a_map if anomaly_map is None else anomaly_map + a_map
+
+    kernel = get_gaussian_kernel(anomaly_map.device)
+    blurred = F.conv2d(anomaly_map, kernel, padding=GAUSS_KERNEL_SIZE // 2)
+    return blurred, layer_maps
+
+# Calculate anomaly score map (numpy wrapper around the canonical definition)
+def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='a'):
+    # amap_mode is kept for signature compatibility; only the additive mode
+    # exists now — it is the canonical definition (the 'mul' branch was unused).
+    blurred, layer_maps = compute_anomaly_map_torch(fs_list, ft_list, out_size)
+    a_map_list = [m.squeeze().cpu().detach().numpy() for m in layer_maps]
+    return blurred.squeeze().cpu().detach().numpy(), a_map_list
 
 # Visualize anomaly map over image
 def show_cam_on_image(img, anomaly_map):
@@ -237,12 +239,21 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, prin
     count = 0
     decoder.eval()
     bn.eval()
+    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
     with torch.no_grad():
         for img, gt, label, _, ip in dataloader:
             print(ip[0][-20:-4])
             if (label.item() == 0):
                 continue
             img = img.to(device)
+            gt = gt.to(device)
+
+            # Canonical preprocessing: denormalize -> dynamic crop -> renormalize
+            img = (img * std_t + mean_t).clamp(0, 1)
+            img, gt = apply_dynamic_crop_gpu(img, masks=gt)
+            img = (img - mean_t) / std_t
+
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)  
 
@@ -291,11 +302,19 @@ def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, devic
     count = 0
     decoder.eval()
     bn.eval()
+    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
     with torch.no_grad():
         for img, label, _  in dataloader:
             if (label.item() == 0):
                 continue
             img = img.to(device)
+
+            # Canonical preprocessing: denormalize -> dynamic crop -> renormalize
+            img = (img * std_t + mean_t).clamp(0, 1)
+            img = apply_dynamic_crop_gpu(img)
+            img = (img - mean_t) / std_t
+
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)  
 
@@ -337,34 +356,26 @@ def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
     gt_list_sp = []
     pr_list_sp = []
     aupro_list = []
-    
-    # Pre-define Gaussian kernel on GPU for speed optimization
-    kernel_size = 15
-    sigma = 4
-    x = torch.arange(kernel_size, device=device).float() - kernel_size // 2
-    gauss = torch.exp(-x**2 / (2 * sigma**2))
-    kernel = (gauss[:, None] * gauss[None, :])
-    kernel = (kernel / kernel.sum()).view(1, 1, kernel_size, kernel_size)
+
+    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
     with torch.no_grad():
         for img, gt, label, _, _ in dataloader:
             img = img.to(device, non_blocking=True)
             gt = gt.to(device, non_blocking=True)
-            
-            # Dynamic crop executed on GPU
+
+            # Canonical order (same as the training loop in main.py): the crop's
+            # 0.94 background threshold is defined on [0,1] images, so
+            # denormalize -> crop -> renormalize.
+            img = (img * std_t + mean_t).clamp(0, 1)
             img, gt = apply_dynamic_crop_gpu(img, masks=gt)
-            
+            img = (img - mean_t) / std_t
+
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)
-            
-            # Anomaly Map Calculation on GPU
-            anomaly_map = torch.zeros((1, 1, 256, 256), device=device)
-            for i in range(len(outputs)):
-                dist = 1 - F.cosine_similarity(inputs[i], outputs[i], dim=1).unsqueeze(1)
-                anomaly_map += F.interpolate(dist, size=256, mode='bilinear', align_corners=False)
-            
-            # Apply Gaussian blur on GPU
-            anomaly_map = F.conv2d(anomaly_map, kernel, padding=kernel_size//2)
+
+            anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, img.shape[-1])
             gt = (gt > 0.5).float()
             
             # AUPRO Calculation (Requires CPU execution for regionprops)

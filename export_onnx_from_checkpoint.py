@@ -1,28 +1,39 @@
 """
-export_onnx_from_checkpoint.py — Export an SK-RD4AD checkpoint to a *pure* ONNX
-graph (encoder + bottleneck + decoder + cosine-distance anomaly map only).
+export_onnx_from_checkpoint.py — Export an SK-RD4AD checkpoint to an ONNX graph
+implementing the repo's CANONICAL anomaly definition (contract 2.0).
 
-Why this changed
-----------------
-The previous export baked resize + ImageNet normalization + Gaussian blur into
-the graph. The GPU runtime (``inference_simulation``) normalizes on the host too,
-so images were normalized twice and the map blurred twice -> meaningless output.
-The graph is now a pure forward pass; all pre/post-processing lives on the host.
+Canonical pipeline (single source of truth: test.py)
+----------------------------------------------------
+dynamic crop (host, on the [0,1] image) -> sum of per-layer (1 - cosine
+similarity) maps, bilinear upsample align_corners=False -> Gaussian blur k=15
+sigma=4 zero padding (IN-GRAPH, kernel imported from test.py) -> score = max of
+the BLURRED map (IN-GRAPH).
 
-Uniform I/O contract (identical for all 4 architectures)
---------------------------------------------------------
-    Input   "input_tensor" : float32 [B, 3, 256, 256]  host-resized + ImageNet-
-            normalized (the RD4AD encoder expects normalized input).
-    Output  "anomaly_map"   : float32 [B, 1, 256, 256]  sum of per-layer
-            (1 - cosine similarity) maps, bilinearly upscaled. NO Gaussian blur.
-    Output  "anomaly_score" : float32 [B]  max over the *raw* (un-blurred) map.
+Contract 2.0 vs 1.0
+-------------------
+Contract 1.0 exported a raw (un-blurred) map and expected the host to blur it
+before scoring; the blur parameters lived in three inconsistent copies
+(test.py sigma=4 zero-pad, eval.py cv2 sigma~2.6 reflect, runtime metadata).
+Contract 2.0 bakes the one canonical blur into the graph, so "anomaly_score"
+is directly comparable with the calibrated threshold and the host does ZERO
+post-processing. A runtime still applying a host-side blur on top of this
+graph would blur twice: score_source="graph" in the metadata exists precisely
+so old runtimes fail loudly instead of doing that silently.
 
-Only the batch axis is dynamic (``dynamic_axes``). Host post-processing (blur +
-folder-global min-max) is unchanged in inference_simulation.
+I/O contract
+------------
+    Input   "input_tensor"  : float32 [B, 3, 256, 256]  host-resized,
+            dynamic-cropped (on the [0,1] image) and ImageNet-normalized.
+    Output  "anomaly_map"   : float32 [B, 1, 256, 256]  canonical BLURRED map.
+    Output  "anomaly_score" : float32 [B]  max of the blurred map — threshold
+            this directly against the calibrated threshold.
+
+Only the batch axis is dynamic (``dynamic_axes``).
 
 The graph is always fp32. Reduced precision (fp16/int8) is intentionally NOT
 produced here: the inference program casts the fp32 graph to its target
 precision, so a single canonical fp32 artifact stays the source of truth.
+(If you deploy in fp16/int8, re-run calibrate_threshold.py in that precision.)
 
 Usage
 -----
@@ -41,6 +52,10 @@ import torch.nn.functional as F
 
 from model.resnet import wide_resnet50_2
 from model.de_resnet import de_wide_resnet50_2
+# The Gaussian kernel is imported from test.py on purpose: it is the SAME
+# object used by eval.py and by training-time model selection. Never redefine
+# it here — that is exactly the training/inference drift this export prevents.
+from test import GAUSS_KERNEL_SIZE, get_gaussian_kernel
 
 # Default number-of-skip-connections parameter (main.py --res default). MUST
 # match the value the checkpoint was TRAINED with: it changes the decoder's
@@ -67,6 +82,9 @@ class RD4ADPure(nn.Module):
         self.bn = bn
         self.decoder = decoder
         self.res = res
+        # Canonical Gaussian blur (test.py: k=15, sigma=4, zero padding) as a
+        # fixed buffer so it is exported as a graph initializer.
+        self.register_buffer("gauss_kernel", get_gaussian_kernel(torch.device("cpu")))
         for p in self.parameters():
             p.requires_grad_(False)
 
@@ -75,7 +93,7 @@ class RD4ADPure(nn.Module):
         recon = self.decoder(self.bn(feats), feats[0:3], self.res)
 
         anomaly_map = None
-        for a, b in zip(feats, recon):
+        for a, b in zip(feats[0:3], recon):
             a_n = F.normalize(a, p=2, dim=1)
             b_n = F.normalize(b, p=2, dim=1)
             dist = 1.0 - torch.sum(a_n * b_n, dim=1, keepdim=True)
@@ -83,8 +101,12 @@ class RD4ADPure(nn.Module):
                                  mode="bilinear", align_corners=False)
             anomaly_map = dist if anomaly_map is None else anomaly_map + dist
 
-        # raw map -> score = spatial max (no blur). squeeze to [B] for a uniform
-        # score signature across all 4 architectures.
+        # Canonical blur baked into the graph, then score = max of the BLURRED
+        # map: this is the number the calibrated threshold applies to, with no
+        # host-side post-processing. squeeze to [B] for a uniform score
+        # signature across all 4 architectures.
+        anomaly_map = F.conv2d(anomaly_map, self.gauss_kernel,
+                               padding=GAUSS_KERNEL_SIZE // 2)
         score = torch.amax(anomaly_map, dim=(2, 3)).squeeze(1)
         return anomaly_map, score
 
@@ -108,48 +130,50 @@ def build_model(checkpoint_path: str | None, device: str, res: int = DEFAULT_RES
 
 # Embedded in the .onnx file so the inference runtime (inference_simulation) can
 # auto-configure itself instead of relying on CLI flags the operator has to
-# remember. score_source="map_max_blurred" tells the runtime the graph's
-# anomaly_score output is NOT the number to threshold on for this architecture
-# (unlike SuperSimpleNet's dedicated classification head) - eval.py's calibrated
-# threshold is computed on max(cv2.GaussianBlur(map, (15,15), sigma=0)), and the
-# graph deliberately omits that blur (see module docstring), so the runtime must
-# reproduce it host-side before scoring. Getting this wrong silently produces a
-# score the ONNX graph did emit, just not the one any threshold was ever
-# calibrated against - a much harder bug to notice than a crash.
+# remember.
+#
+# score_source="graph" (contract 2.0): the Gaussian blur is baked INTO the
+# graph, so "anomaly_score" is the max of the already-blurred map and is
+# directly comparable with the calibrated threshold. The runtime must NOT
+# apply any host-side blur (doing so would blur twice) and must NOT recompute
+# the score from the map. A runtime that only understands contract 1.0
+# ("map_max_blurred") must treat this value as an error and refuse to run,
+# not silently fall back.
 #
 # dynamic_crop=true: main.py's training loop ALWAYS applies
 # apply_dynamic_crop_gpu (test.py) before the encoder - it crops to the
 # bounding box of non-background pixels and rescales it to fill the frame, to
-# normalize object scale. test.py's evaluation_me/evaluation (used for the
-# training loop's own AUROC) apply it too. inference_simulation must replicate
-# it or the model receives a different object scale/framing than it was
-# trained on - uniformly bad reconstruction (raw scores stuck near their
-# maximum, ~0.999, for every image regardless of content) is the exact
-# signature of this mismatch.
+# normalize object scale. The crop operates on the DENORMALIZED [0,1] image
+# (its 0.94 background threshold is defined there); host order is:
+# resize 256 -> scale to [0,1] -> dynamic crop -> ImageNet normalize -> graph.
+# Skipping it (or cropping the normalized image) feeds the model a different
+# framing than it was trained on - uniformly bad reconstruction (raw scores
+# stuck near their maximum for every image) is the exact signature.
 #
-# IMPORTANT CAVEAT: eval.py - the script that computes 'best_threshold_raw' -
-# does NOT apply this crop (it feeds the dataloader's image straight to the
-# encoder), unlike test.py. This is an inconsistency in the training repo
-# itself, not introduced by this export. Enabling the crop here (matching how
-# the network was actually TRAINED, i.e. test.py's convention) means a
-# best_threshold_raw obtained from eval.py may no longer be the right
-# threshold, since eval.py's score distribution was computed WITHOUT cropping.
-# Recompute the threshold with a crop-consistent evaluation before trusting
-# production verdicts.
+# Threshold: eval.py now applies the identical canonical pipeline (crop +
+# in-graph blur definition), so its calibration JSON agrees with this graph up
+# to floating-point drift. The authoritative number to ship, though, is the
+# one from calibrate_threshold.py in this repo: it computes the threshold by
+# running THIS .onnx file, so preprocessing and graph are the production ones
+# by construction. Cross-check the two; embed with --embed.
 EXPORT_METADATA = {
-    "anomaly_export_contract": "1.0",
+    "anomaly_export_contract": "2.0",
     "architecture": "sk_rd4ad",
-    "score_source": "map_max_blurred",
+    "score_source": "graph",
+    "map_blur": "baked_in_graph",
     "blur_kernel_size": "15",
-    "blur_sigma": "0.0",       # 0.0 => let cv2.GaussianBlur derive sigma from kernel_size (matches eval.py)
+    "blur_sigma": "4.0",       # test.py canonical kernel (training model selection)
+    "blur_padding": "zeros",
     "dynamic_crop": "true",
     "dynamic_crop_bg_threshold": "0.94",
     "dynamic_crop_padding": "30",
-    "verified": "true",        # validated end-to-end 2026-07-09 on Colab: real checkpoint
-                               # (auc=0.91), real fabric images, defect correctly localized
-                               # in the anomaly map. The eval.py threshold caveat above still
-                               # applies: calibrate with inference_simulation's
-                               # calibrate_threshold.py, not with eval.py's best_threshold_raw.
+    "dynamic_crop_input_range": "0_1_before_normalization",
+    "verified": "false",       # contract 2.0 not yet e2e-revalidated on Colab
+                               # (contract 1.0 was, 2026-07-09: real checkpoint,
+                               # auc=0.91, defect correctly localized). Graph
+                               # parity is checked at export time by verify();
+                               # run parity_check.py + calibrate_threshold.py,
+                               # then flip this after the e2e rerun.
 }
 
 
@@ -288,7 +312,7 @@ def main():
     out_path = resolve_output_path(args.output, ckpt)
     weights_source = f"checkpoint:{Path(ckpt).name}" if ckpt else "random_self_test"
 
-    print(f"\n--- Exporting SK-RD4AD (pure graph, weights: {weights_source}, res={args.res}) -> {out_path} ---")
+    print(f"\n--- Exporting SK-RD4AD (contract 2.0: blur+score in-graph, weights: {weights_source}, res={args.res}) -> {out_path} ---")
     export_fp32(model, out_path, device, weights_source)
     print(f"[OK] fp32 export: {out_path}")
 

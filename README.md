@@ -24,6 +24,31 @@ SK-RD4AD (Skip-Connected Reverse Distillation for Anomaly Detection) introduces 
 
 ---
 
+## 📐 Canonical inference pipeline (training ↔ ONNX parity)
+
+Every score-producing path in this repo — training-time model selection
+(`test.py`), the reference evaluation (`eval.py`), the ONNX export
+(`export_onnx_from_checkpoint.py`, contract 2.0) and the production runtime —
+implements **one** definition:
+
+```
+resize 256 → scale to [0,1] → dynamic crop (bg 0.94, pad 30) → ImageNet normalize
+→ sum of per-layer (1 − cos similarity) maps, bilinear align_corners=False
+→ Gaussian blur k=15 σ=4 zero-padding   (baked INTO the ONNX graph)
+→ image score = max of the BLURRED map  (baked INTO the ONNX graph)
+```
+
+The single source of truth is `test.py` (`GAUSS_KERNEL_SIZE`, `GAUSS_SIGMA`,
+`get_gaussian_kernel`, `compute_anomaly_map_torch`) — never redefine the kernel
+or the map elsewhere. Workflow for shipping a model:
+
+1. `python export_onnx_from_checkpoint.py ckpt.pth out.onnx --res <res>` — exports + verifies graph parity.
+2. `python parity_check.py --checkpoint ckpt.pth --model out.onnx --data_path ... --class_ ...` — PyTorch↔ONNX on real images (must PASS).
+3. `python calibrate_threshold.py --model out.onnx --data_path ... --class_ ... --embed` — computes the F1-optimal threshold **through the ONNX pipeline** and embeds it in the model metadata (`calibrated_threshold`).
+4. Cross-check with `eval.py`'s `calibration_pytorch.json`: the two thresholds must agree to floating-point precision.
+
+---
+
 
 ## 📂 Model Overview
 SK-RD4AD enhances the original RD4AD framework by addressing deep-layer information loss. It introduces strategically designed non-corresponding skip connections that allow features from shallower teacher layers to influence deeper student layers. This architecture improves the decoder’s capacity to reconstruct complex features and leads to significantly better anomaly localization performance.

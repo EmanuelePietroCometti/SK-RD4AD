@@ -8,8 +8,9 @@ import torch.nn.functional as F
 from sklearn.metrics import (roc_auc_score, f1_score, precision_score, 
                              recall_score, accuracy_score, confusion_matrix, 
                              precision_recall_curve, average_precision_score)
-from test import compute_pro
+from test import compute_pro, apply_dynamic_crop_gpu, compute_anomaly_map_torch
 from torch.utils.data import DataLoader
+import json
 
 from dataset.dataset import get_data_transforms, MVTecDataset, MVTecDataset_no_seg
 from model.resnet import resnet18, resnet34, resnet50, wide_resnet50_2
@@ -17,36 +18,13 @@ from model.de_resnet import de_resnet18, de_resnet34, de_wide_resnet50_2, de_res
 
 def compute_image_anomaly_score_and_map(inputs, outputs, image_size):
     """
-    Computes the image-level anomaly score and spatial map using Cosine Similarity.
-    Applies Gaussian smoothing BEFORE extracting the max score to ensure stability.
+    Computes the image-level anomaly score and spatial map using the CANONICAL
+    definition shared with test.py (and baked into the ONNX export): sum of
+    per-layer (1 - cosine similarity) maps upsampled with align_corners=False,
+    Gaussian blur k=15 sigma=4 with zero padding — the exact kernel used for
+    model selection during training. Score = max of the BLURRED map.
     """
-    anomaly_map = torch.zeros(1, 1, image_size, image_size).to(inputs[0].device)
-    
-    for i in range(len(outputs)):
-        a = inputs[i]
-        b = outputs[i]
-        
-        a_norm = F.normalize(a, p=2, dim=1)
-        b_norm = F.normalize(b, p=2, dim=1)
-        
-        # Compute Cosine Similarity
-        distance = 1 - torch.sum(a_norm * b_norm, dim=1, keepdim=True)
-        
-        # Interpolate to original image size
-        distance = F.interpolate(distance, size=(image_size, image_size), 
-                                 mode='bilinear', align_corners=False)
-        anomaly_map += distance
-        
-    # Move to CPU and convert to Numpy for OpenCV processing
-    amap_np = anomaly_map.squeeze().cpu().numpy()
-    
-    # Apply Gaussian Blur using a 15x15 kernel (standard for 256x256 resolution)
-    amap_np = cv2.GaussianBlur(amap_np, (15, 15), 0)
-    
-    # Convert back to tensor to maintain compatibility with the pipeline
-    anomaly_map = torch.from_numpy(amap_np).unsqueeze(0).unsqueeze(0).to(inputs[0].device)
-    
-    # The extracted max() is now consistent with the saved anomaly map
+    anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, image_size)
     return anomaly_map.max().item(), anomaly_map
 
 def save_confusion_map(img_tensor, mask_tensor, anomaly_map_tensor, save_path, global_min=0.0, global_max=1.0, threshold=0.5):
@@ -179,7 +157,11 @@ def evaluate_and_save_maps(args):
         os.makedirs(os.path.join(args.img_path, cat), exist_ok=True)
 
     results_memory = []
-    
+
+    # Tensors for the canonical denormalize -> crop -> renormalize step
+    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
     print("Phase 1/2: Extracting anomaly scores and spatial maps...")
     with torch.no_grad():
         for idx, batch in enumerate(test_dataloader):
@@ -209,6 +191,19 @@ def evaluate_and_save_maps(args):
                 else:
                     raise RuntimeError("Dataset returned neither a label nor a mask.")
             
+            # Canonical preprocessing, identical to the training loop (main.py)
+            # and to what the inference runtime does: the dynamic crop operates
+            # on the DENORMALIZED [0,1] image (its 0.94 background threshold is
+            # defined there), then the crop is renormalized for the encoder.
+            # Without this crop the threshold computed below would live on a
+            # different score distribution than production inference.
+            img = (img * std_t + mean_t).clamp(0, 1)
+            if mask is not None:
+                img, mask = apply_dynamic_crop_gpu(img, masks=mask)
+            else:
+                img = apply_dynamic_crop_gpu(img)
+            img = (img - mean_t) / std_t
+
             # Forward pass
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], args.res)
@@ -310,6 +305,26 @@ def evaluate_and_save_maps(args):
         print(f"AP-loc:            {ap_loc:.4f}")
         print(f"Pixel AUROC:       {auroc_px:.4f}")
     print("=" * 50)
+
+    # Persist the calibration so it can travel with the model and be
+    # cross-checked against calibrate_threshold.py (the ONNX-pipeline
+    # calibration): with the canonical pipeline the two must agree up to
+    # floating-point drift.
+    calibration = {
+        "pipeline": "dynamic_crop -> sum(1-cos, align_corners=False) -> gauss_k15_sigma4_zeropad -> max",
+        "source": "eval.py (PyTorch reference)",
+        "checkpoint": os.path.basename(args.checkpoint_path),
+        "class": args.class_,
+        "threshold": float(best_threshold_raw),
+        "global_min": float(global_min),
+        "global_max": float(global_max),
+        "auroc_sp": float(auroc_sp),
+        "f1_sp": float(f1_sp),
+    }
+    calib_path = os.path.join(args.img_path, "calibration_pytorch.json")
+    with open(calib_path, "w") as f:
+        json.dump(calibration, f, indent=2)
+    print(f"Calibration saved to {calib_path}")
 
     print("\nPhase 2/2: Saving visualizations categorized by Confusion Matrix...")
     for res in results_memory:
