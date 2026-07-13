@@ -1,3 +1,4 @@
+
 """
 dust_contrastive.py
 ====================
@@ -150,8 +151,19 @@ class DustBank:
         return out
 
     @staticmethod
-    def _rotate(patch, angle_deg):
-        return F_v2.rotate(patch.unsqueeze(0), angle_deg, expand=True).squeeze(0)
+    def _rotate_with_alpha(patch, angle_deg):
+        """
+        Ruota patch E una maschera "piena" con la stessa chiamata (stesso expand=True).
+        NECESSARIO: senza questo, i pixel di padding introdotti da expand=True (riempiti di
+        nero, fill=0 di default) verrebbero incollati come se fossero parte del difetto,
+        creando un rettangolo nero ben visibile con bordi netti — un falso segnale "ovvio"
+        che il modello imparerebbe come scorciatoia invece di generalizzare su difetti reali
+        (esattamente il tipo di boundary-artifact contro cui mettono in guardia DRAEM/NSA).
+        """
+        patch_r = F_v2.rotate(patch.unsqueeze(0), angle_deg, expand=True).squeeze(0)
+        ones_mask = torch.ones((1, *patch.shape[-2:]), device=patch.device)
+        alpha_r = F_v2.rotate(ones_mask.unsqueeze(0), angle_deg, expand=True).squeeze(0)
+        return patch_r, alpha_r
 
     # ------------------------------------------------------------------ #
     # View POSITIVA: polvere reale (deve restare vicina all'anchor pulito)
@@ -212,23 +224,32 @@ class DustBank:
 
         # Jitter fotometrico: rompe la scorciatoia "stesso identico pixel = difetto" e forza
         # il modello a ragionare sulla struttura, non sul valore assoluto del pixel.
-        patch = patch * random.uniform(0.7, 1.3) + random.uniform(-0.05, 0.05)
+        # NB: un jitter puramente moltiplicativo (patch*factor) e' quasi invisibile quando i
+        # pixel di partenza sono gia' vicini allo zero (tessuti scuri: 0.7*0.05 =~ 0.035,
+        # differenza impercettibile). Mescolare verso un livello di grigio casuale garantisce
+        # un contrasto minimo visibile indipendentemente dalla luminosita' di partenza.
+        target_gray = random.uniform(0.0, 1.0)
+        blend_strength = random.uniform(0.35, 0.75)
+        patch = patch * (1 - blend_strength) + target_gray * blend_strength
         patch = patch.clamp(0, 1)
 
         if mode == "scar":
             angle = random.uniform(-45, 45)
-            patch = self._rotate(patch, angle)
+            patch, alpha = self._rotate_with_alpha(patch, angle)
+        else:
+            alpha = torch.ones((1, ph, pw), device=img.device)
 
         ph, pw = patch.shape[-2:]
         top = random.randint(0, max(H - ph, 0))
         left = random.randint(0, max(W - pw, 0))
-        alpha = torch.ones((1, ph, pw), device=img.device)
 
         out = self._alpha_paste(img, patch, alpha, top, left, opacity=1.0)
 
+        # La mask segue l'alpha REALE (utile soprattutto per "scar": fuori dal parallelogramma
+        # ruotato alpha=0, quindi quei pixel restano fuori mask correttamente).
         mask = torch.zeros((1, H, W), device=img.device)
         eff_h, eff_w = min(ph, H - top), min(pw, W - left)
-        mask[:, top:top + eff_h, left:left + eff_w] = 1.0
+        mask[:, top:top + eff_h, left:left + eff_w] = (alpha[:, :eff_h, :eff_w] > 0.5).float()
         return out.clamp(0, 1), mask
 
     # ------------------------------------------------------------------ #
@@ -270,6 +291,15 @@ class ProjectionHead(nn.Module):
 
     `in_channels` va dedotto a runtime (vedi main.py: una forward "a vuoto" prima di costruire
     l'head) invece di hardcodarlo, per non rompersi silenziosamente cambiando --net.
+
+    NOTA: usa LayerNorm, non BatchNorm1d. Nel training loop questa head viene chiamata TRE
+    volte separate per epoca-step (proj_head(embed_a), proj_head(embed_p), proj_head(embed_n)),
+    ognuna su un gruppo di sole `batch_size` immagini (es. 4). Con BatchNorm1d, le statistiche
+    di normalizzazione dipenderebbero dalla composizione di quel singolo gruppo — un problema
+    documentato in letteratura per il contrastive learning (es. MoCo, He et al. CVPR 2020,
+    che introduce la "shuffling BN" proprio per evitare che la rete sfrutti le statistiche di
+    batch invece di imparare separazione genuina campione-per-campione). LayerNorm normalizza
+    per-campione ed è indipendente dalla composizione/dimensione del batch.
     """
 
     def __init__(self, in_channels, hidden_dim=512, out_dim=128):
@@ -277,7 +307,7 @@ class ProjectionHead(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.net = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )

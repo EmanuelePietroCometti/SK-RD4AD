@@ -238,9 +238,9 @@ def check_contrastive_loss():
     ok("gradiente valido e non-nullo attraverso ProjectionHead + contrastive loss")
 
     if B < 2:
-        fail("BatchNorm1d nella ProjectionHead richiede batch_size >= 2 in training: "
-             "verifica che --batch_size sia almeno 2 quando --contrastive 1.")
-    ok(f"batch_size={B} compatibile con BatchNorm1d della ProjectionHead")
+        fail("build_views richiede batch_size >= 2: serve un'immagine 'donor' diversa da se stessa "
+             "per generare i pseudo-difetti CutPaste/Scar.")
+    ok(f"batch_size={B} compatibile con il meccanismo donor (build_views)")
 
 
 def main():

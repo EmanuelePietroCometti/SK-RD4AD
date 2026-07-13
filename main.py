@@ -175,7 +175,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             raise ValueError("--contrastive 1 richiede --dust_bank_path (esegui prima verify_dust_pipeline.py).")
         if batch_size < 2:
             raise ValueError("--contrastive 1 richiede batch_size >= 2 (serve un'immagine 'donor' diversa "
-                              "per generare i pseudo-difetti, e BatchNorm1d nella ProjectionHead richiede batch>=2).")
+                              "da se stessa per generare i pseudo-difetti CutPaste/Scar).")
         dust_bank = DustBank(dust_bank_path, device)
 
         # Rileva a runtime il numero di canali dell'embedding OCBE (bn(inputs)): dipende da --net
@@ -222,6 +222,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             proj_head.train()
         loss_list = []
         loss_recon_list, loss_dust_recon_list, loss_contrastive_list = [], [], []
+        sim_pos_list, sim_neg_list = [], []
         for img, label in train_dataloader:
             img = img.to(device, non_blocking=True) 
             img = data_transform(img)
@@ -306,6 +307,13 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 c_loss = dust_contrastive_loss(z_a, z_p, z_n, temperature=contrastive_temp)
                 loss = loss + contrastive_rate * c_loss
 
+                # Diagnostica scale-free (NON dipende da contrastive_temp, a differenza di c_loss):
+                # e' la similarita' coseno grezza, l'unica cosa che dice davvero "quanto sono
+                # separati" anchor/polvere vs anchor/pseudo-difetto nello spazio dell'embedding.
+                with torch.no_grad():
+                    sim_pos_mean = (z_a * z_p).sum(dim=1).mean().item()
+                    sim_neg_mean = (z_a * z_n).sum(dim=1).mean().item()
+
             optimizer.zero_grad() 
             loss.backward()
             optimizer.step()
@@ -314,12 +322,16 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             if contrastive == 1:
                 loss_dust_recon_list.append(dust_recon_loss.item())
                 loss_contrastive_list.append(c_loss.item())
+                sim_pos_list.append(sim_pos_mean)
+                sim_neg_list.append(sim_neg_mean)
 
         if print_loss == 1:
             if contrastive == 1:
                 print('epoch [{}/{}], loss_totale:{:.4f}  (recon_clean:{:.4f}  recon_dust:{:.4f}  contrastive:{:.4f})'.format(
                     epoch + 1, epochs, np.mean(loss_list), np.mean(loss_recon_list),
                     np.mean(loss_dust_recon_list), np.mean(loss_contrastive_list)))
+                print('           cos_sim(anchor,polvere)={:.3f}  cos_sim(anchor,difetto)={:.3f}  gap={:.3f}'.format(
+                    np.mean(sim_pos_list), np.mean(sim_neg_list), np.mean(sim_pos_list) - np.mean(sim_neg_list)))
             else:
                 print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, epochs, np.mean(loss_list)))
 
@@ -445,4 +457,4 @@ if __name__ == '__main__':
                 setup_seed(seed)
                 train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed,
                       contrastive=args.contrastive, contrastive_rate=args.contrastive_rate, contrastive_temp=args.contrastive_temp, dust_bank_path=args.dust_bank_path)
-                print('*************************') 
+                print('*************************')
