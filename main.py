@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import cv2
 
 from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
+from dust_contrastive import DustBank, ProjectionHead, dust_contrastive_loss
 
 def raw_tensor_loader(path):
     # Read the image using OpenCV (loads in BGR format by default)
@@ -98,7 +99,8 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, save_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed): 
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, save_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed,
+          contrastive=0, contrastive_rate=0.1, contrastive_temp=0.1, dust_bank_path=None): 
     image_size = 256
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
@@ -163,6 +165,32 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         decoder = de_resnet50(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
 
+    dust_bank = None
+    proj_head = None
+    if contrastive == 1:
+        if not dust_bank_path:
+            raise ValueError("--contrastive 1 richiede --dust_bank_path (esegui prima verify_dust_pipeline.py).")
+        if batch_size < 2:
+            raise ValueError("--contrastive 1 richiede batch_size >= 2 (serve un'immagine 'donor' diversa "
+                              "per generare i pseudo-difetti, e BatchNorm1d nella ProjectionHead richiede batch>=2).")
+        dust_bank = DustBank(dust_bank_path, device)
+
+        # Rileva a runtime il numero di canali dell'embedding OCBE (bn(inputs)): dipende da --net
+        # (2048 per wide_res50/res50 con Bottleneck, 512 per res18/res34 con BasicBlock). Evitiamo
+        # di hardcodarlo per non rompere silenziosamente la ProjectionHead cambiando --net.
+        with torch.no_grad():
+            dummy = torch.zeros(2, 3, image_size, image_size, device=device)
+            dummy_inputs = encoder(dummy)
+            dummy_embed = bn(dummy_inputs)
+            ocbe_channels = dummy_embed.shape[1]
+        proj_head = ProjectionHead(in_channels=ocbe_channels).to(device)
+        print(f"[contrastive] OCBE embedding channels = {ocbe_channels}, "
+              f"contrastive_rate = {contrastive_rate}, contrastive_temp = {contrastive_temp}")
+
+    optimizer_params = list(decoder.parameters()) + list(bn.parameters())
+    if proj_head is not None:
+        optimizer_params += list(proj_head.parameters())
+
     optimizer = torch.optim.Adam(list(decoder.parameters())+list(bn.parameters()), lr=learning_rate, betas=(0.5,0.999))  # Pass a list of parameters to be optimized
 
     max_auc = []
@@ -188,7 +216,10 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     for epoch in range(epochs):
         decoder.train()
         bn.train()
+        if proj_head is not None:
+            proj_head.train()
         loss_list = []
+        loss_recon_list, loss_dust_recon_list, loss_contrastive_list = [], [], []
         for img, label in train_dataloader:
             img = img.to(device, non_blocking=True) 
             img = data_transform(img)
@@ -211,20 +242,69 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             # Standard spatial and color transformations
             img = gpu_transforms(img)
 
+            # ---- DUST CONTRASTIVE LOSS: genera le view a partire dall'immagine pulita ----
+            # Va fatto QUI: img è ancora in [0,1] e ha già subito crop/augmentation geometriche,
+            # cosi' la polvere/il pseudo-difetto vengono incollati in coordinate coerenti con
+            # l'oggetto (non rischiano di finire fuori dal crop dinamico).
+            if contrastive == 1:
+                img_p, img_n = dust_bank.build_views(img)
+                img_p = (img_p - mean_t) / std_t
+                img_n = (img_n - mean_t) / std_t
+
             # Renormalize back to ImageNet standard for ResNet encoder
             img = (img - mean_t) / std_t
             # ==========================================
 
             # The encoder is frozen: skip autograd graph construction for it
             # (saves memory and compute; gradients only flow through bn/decoder)
+            if contrastive == 1:
+                combined = torch.cat([img, img_p, img_n], dim=0)
+            else:
+                combined = img
+
+            # The encoder is frozen: skip autograd graph construction for it
+            # (saves memory and compute; gradients only flow through bn/decoder)
             with torch.no_grad():
-                inputs = encoder(img)
-            outputs = decoder(bn(inputs), inputs[0:3], res)
+                inputs_all = encoder(combined)
+
+            if contrastive == 1:
+                Bsz = img.shape[0]
+                inputs = [t[:Bsz] for t in inputs_all]
+                inputs_p = [t[Bsz:2 * Bsz] for t in inputs_all]
+                inputs_n = [t[2 * Bsz:] for t in inputs_all]
+            else:
+                inputs = inputs_all
+
+            embed_a = bn(inputs)
+            outputs = decoder(embed_a, inputs[0:3], res)
 
             # Choose loss function
-            loss = loss_function(inputs[0:3], outputs, L2)
+            recon_loss = loss_function(inputs[0:3], outputs, L2)
+            loss = recon_loss
             if layerloss == 1:
                 loss = loss + rate * loss_function_2(inputs[0:3], outputs)
+ 
+            dust_recon_loss = torch.tensor(0.0, device=device)
+            c_loss = torch.tensor(0.0, device=device)
+            if contrastive == 1:
+                # Il decoder deve imparare a ricostruire correttamente anche le feature "sporche"
+                # di polvere: senza questo termine, la mappa di anomalia pixel-level resterebbe
+                # comunque alta sulla polvere in inferenza, indipendentemente da quanto sia pulito
+                # lo spazio dell'embedding grazie alla contrastive loss (che agisce solo sul
+                # bottleneck, non sulla ricostruzione pixel-level).
+                embed_p = bn(inputs_p)
+                outputs_p = decoder(embed_p, inputs_p[0:3], res)
+                dust_recon_loss = loss_function(inputs_p[0:3], outputs_p, L2)
+                loss = loss + dust_recon_loss
+ 
+                # Non serve il decoder per il negativo: ci serve solo l'embedding OCBE
+                embed_n = bn(inputs_n)
+ 
+                z_a = proj_head(embed_a)
+                z_p = proj_head(embed_p)
+                z_n = proj_head(embed_n)
+                c_loss = dust_contrastive_loss(z_a, z_p, z_n, temperature=contrastive_temp)
+                loss = loss + contrastive_rate * c_loss
 
             optimizer.zero_grad() 
             loss.backward()
@@ -232,7 +312,12 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             loss_list.append(loss.item()) 
 
         if print_loss == 1:
-            print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, epochs, np.mean(loss_list)))
+            if contrastive == 1:
+                print('epoch [{}/{}], loss_totale:{:.4f}  (recon_clean:{:.4f}  recon_dust:{:.4f}  contrastive:{:.4f})'.format(
+                    epoch + 1, epochs, np.mean(loss_list), np.mean(loss_recon_list),
+                    np.mean(loss_dust_recon_list), np.mean(loss_contrastive_list)))
+            else:
+                print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, epochs, np.mean(loss_list)))
 
         if (epoch + 1) % print_epoch == 0:
             # Test set without mask
@@ -320,6 +405,12 @@ if __name__ == '__main__':
     parser.add_argument('--print_max', default=1, type=int)  # Whether to print the best AUC
     parser.add_argument('--net', default='wide_res50', type=str)  # Available net types, can choose res18, res34, res50, wide_res50
     parser.add_argument('--L2', default=0, type=int)  # Whether to use L2 loss function
+
+    # New parameters
+    parser.add_argument('--contrastive', default=0, type=int)  # Whether to use the dust-vs-defect contrastive loss (branch contrastive_loss)
+    parser.add_argument('--contrastive_rate', default=0.1, type=float)  # Weight (lambda) of the contrastive loss term — DA VALIDARE via ablation
+    parser.add_argument('--contrastive_temp', default=0.1, type=float)  # Temperature for the N-pair/InfoNCE loss — DA VALIDARE via ablation
+    parser.add_argument('--dust_bank_path', default=None, type=str) # Path to dust_bank/ (contiene raw_images, dust_images, dust_masks). Richiesto se --contrastive 1
     args = parser.parse_args()
 
     print('--------args----------')
@@ -341,7 +432,8 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed)
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed,
+                  contrastive=args.contrastive, contrastive_rate=args.contrastive_rate, contrastive_temp=args.contrastive_temp, dust_bank_path=args.dust_bank_path)
             print('*************************')  
 
     if args.class_ != 'all':
@@ -349,5 +441,6 @@ if __name__ == '__main__':
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed)
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed,
+                      contrastive=args.contrastive, contrastive_rate=args.contrastive_rate, contrastive_temp=args.contrastive_temp, dust_bank_path=args.dust_bank_path)
                 print('*************************') 
