@@ -100,7 +100,7 @@ def loss_function_2(a, b):  # Input two tensor arrays
     return loss2
 
 def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, save_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed,
-          contrastive=0, contrastive_rate=0.1, contrastive_temp=0.1, dust_bank_path=None): 
+          contrastive=0, contrastive_rate=0.1, contrastive_temp=0.1, dust_bank_path=None):
     image_size = 256
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
@@ -165,6 +165,9 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         decoder = de_resnet50(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
 
+    # ==========================================
+    # DUST CONTRASTIVE LOSS: setup (branch contrastive_loss)
+    # ==========================================
     dust_bank = None
     proj_head = None
     if contrastive == 1:
@@ -190,8 +193,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     optimizer_params = list(decoder.parameters()) + list(bn.parameters())
     if proj_head is not None:
         optimizer_params += list(proj_head.parameters())
-
-    optimizer = torch.optim.Adam(list(decoder.parameters())+list(bn.parameters()), lr=learning_rate, betas=(0.5,0.999))  # Pass a list of parameters to be optimized
+    optimizer = torch.optim.Adam(optimizer_params, lr=learning_rate, betas=(0.5,0.999))  # Pass a list of parameters to be optimized
 
     max_auc = []
     max_auc_epoch = []
@@ -262,8 +264,6 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             else:
                 combined = img
 
-            # The encoder is frozen: skip autograd graph construction for it
-            # (saves memory and compute; gradients only flow through bn/decoder)
             with torch.no_grad():
                 inputs_all = encoder(combined)
 
@@ -283,7 +283,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             loss = recon_loss
             if layerloss == 1:
                 loss = loss + rate * loss_function_2(inputs[0:3], outputs)
- 
+
             dust_recon_loss = torch.tensor(0.0, device=device)
             c_loss = torch.tensor(0.0, device=device)
             if contrastive == 1:
@@ -296,10 +296,10 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 outputs_p = decoder(embed_p, inputs_p[0:3], res)
                 dust_recon_loss = loss_function(inputs_p[0:3], outputs_p, L2)
                 loss = loss + dust_recon_loss
- 
+
                 # Non serve il decoder per il negativo: ci serve solo l'embedding OCBE
                 embed_n = bn(inputs_n)
- 
+
                 z_a = proj_head(embed_a)
                 z_p = proj_head(embed_p)
                 z_n = proj_head(embed_n)
@@ -309,7 +309,11 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             optimizer.zero_grad() 
             loss.backward()
             optimizer.step()
-            loss_list.append(loss.item()) 
+            loss_list.append(loss.item())
+            loss_recon_list.append(recon_loss.item())
+            if contrastive == 1:
+                loss_dust_recon_list.append(dust_recon_loss.item())
+                loss_contrastive_list.append(c_loss.item())
 
         if print_loss == 1:
             if contrastive == 1:
@@ -405,12 +409,10 @@ if __name__ == '__main__':
     parser.add_argument('--print_max', default=1, type=int)  # Whether to print the best AUC
     parser.add_argument('--net', default='wide_res50', type=str)  # Available net types, can choose res18, res34, res50, wide_res50
     parser.add_argument('--L2', default=0, type=int)  # Whether to use L2 loss function
-
-    # New parameters
     parser.add_argument('--contrastive', default=0, type=int)  # Whether to use the dust-vs-defect contrastive loss (branch contrastive_loss)
     parser.add_argument('--contrastive_rate', default=0.1, type=float)  # Weight (lambda) of the contrastive loss term — DA VALIDARE via ablation
     parser.add_argument('--contrastive_temp', default=0.1, type=float)  # Temperature for the N-pair/InfoNCE loss — DA VALIDARE via ablation
-    parser.add_argument('--dust_bank_path', default=None, type=str) # Path to dust_bank/ (contiene raw_images, dust_images, dust_masks). Richiesto se --contrastive 1
+    parser.add_argument('--dust_bank_path', default=None, type=str)  # Path to dust_bank/ (contiene raw_images, dust_images, dust_masks). Richiesto se --contrastive 1
     args = parser.parse_args()
 
     print('--------args----------')
