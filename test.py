@@ -114,6 +114,62 @@ def compute_anomaly_map_torch(fs_list, ft_list, out_size):
     blurred = F.conv2d(anomaly_map, kernel, padding=GAUSS_KERNEL_SIZE // 2)
     return blurred, layer_maps
 
+
+def image_score_from_map(blurred_map, border_margin=0):
+    """
+    Punteggio immagine-per-immagine = massimo della mappa sfumata, con
+    l'opzione di escludere un margine di bordo (in pixel, alla risoluzione
+    della mappa). border_margin=0 (default) = comportamento invariato
+    (max su tutta la mappa).
+
+    Motivazione: le CNN con zero-padding hanno un bias noto agli angoli/bordi
+    (Islam et al., "How Much Position Information Do Convolutional Neural
+    Networks Encode?", ICLR 2020) — su dataset a tessitura piena-cornice
+    (nessun vero sfondo) puo' manifestarsi come un falso positivo sistematico
+    sempre nella stessa posizione geometrica, indipendente dal contenuto
+    dell'immagine. Questa funzione NON modifica la mappa restituita per la
+    segmentazione pixel-level — serve solo per la decisione immagine-per-
+    immagine (soglia, AUROC campione).
+    """
+    if blurred_map.dim() == 3:
+        blurred_map = blurred_map.unsqueeze(1)
+    B, C, H, W = blurred_map.shape
+    m = border_margin
+    if m <= 0 or H - 2 * m <= 0 or W - 2 * m <= 0:
+        return blurred_map.amax(dim=(2, 3)).squeeze(1)
+    interior = blurred_map[:, :, m:H - m, m:W - m]
+    return interior.amax(dim=(2, 3)).squeeze(1)
+
+
+def image_score_corner_masked(blurred_map, corner_size=0):
+    """
+    Variante piu' chirurgica di image_score_from_map: esclude SOLO i 4
+    quadrati d'angolo (corner_size x corner_size ciascuno), non l'intera
+    fascia di bordo. Da preferire a border_margin quando l'evidenza (es.
+    ispezione visiva delle heatmap) mostra un artefatto concentrato
+    specificamente agli angoli e non lungo tutto il perimetro: un
+    border_margin uniforme butta via un'area molto piu' grande (l'intera
+    fascia perimetrale) di quanto serva, rischiando di escludere anche
+    segnale utile (difetti veri vicino al bordo ma non in un angolo).
+
+    corner_size=0 (default) = comportamento invariato (max su tutta la mappa).
+    """
+    if blurred_map.dim() == 3:
+        blurred_map = blurred_map.unsqueeze(1)
+    B, C, H, W = blurred_map.shape
+    c = corner_size
+    if c <= 0 or 2 * c >= H or 2 * c >= W:
+        return blurred_map.amax(dim=(2, 3)).squeeze(1)
+
+    mask = torch.ones((H, W), dtype=torch.bool, device=blurred_map.device)
+    mask[:c, :c] = False       # angolo alto-sinistra
+    mask[:c, W - c:] = False   # angolo alto-destra
+    mask[H - c:, :c] = False   # angolo basso-sinistra
+    mask[H - c:, W - c:] = False  # angolo basso-destra
+
+    masked = blurred_map.masked_fill(~mask.view(1, 1, H, W), float('-inf'))
+    return masked.amax(dim=(2, 3)).squeeze(1)
+
 # Calculate anomaly score map (numpy wrapper around the canonical definition)
 def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='a'):
     # amap_mode is kept for signature compatibility; only the additive mode

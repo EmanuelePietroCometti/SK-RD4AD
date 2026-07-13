@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from sklearn.metrics import (roc_auc_score, f1_score, precision_score, 
                              recall_score, accuracy_score, confusion_matrix, 
                              precision_recall_curve, average_precision_score)
-from test import compute_pro, apply_dynamic_crop_gpu, compute_anomaly_map_torch
+from test import compute_pro, apply_dynamic_crop_gpu, compute_anomaly_map_torch, image_score_from_map, image_score_corner_masked
 from torch.utils.data import DataLoader
 import json
 
@@ -16,16 +16,24 @@ from dataset.dataset import get_data_transforms, MVTecDataset, MVTecDataset_no_s
 from model.resnet import resnet18, resnet34, resnet50, wide_resnet50_2
 from model.de_resnet import de_resnet18, de_resnet34, de_wide_resnet50_2, de_resnet50
 
-def compute_image_anomaly_score_and_map(inputs, outputs, image_size):
+def compute_image_anomaly_score_and_map(inputs, outputs, image_size, border_margin=0, corner_size=0):
     """
     Computes the image-level anomaly score and spatial map using the CANONICAL
     definition shared with test.py (and baked into the ONNX export): sum of
     per-layer (1 - cosine similarity) maps upsampled with align_corners=False,
     Gaussian blur k=15 sigma=4 with zero padding — the exact kernel used for
     model selection during training. Score = max of the BLURRED map.
+
+    border_margin: pixel esclusi dall'INTERA fascia di bordo (uniforme sui 4 lati).
+    corner_size: pixel esclusi SOLO nei 4 quadrati d'angolo (piu' chirurgico).
+    Usa uno dei due, non entrambi insieme. Default 0/0 = comportamento invariato.
     """
     anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, image_size)
-    return anomaly_map.max().item(), anomaly_map
+    if corner_size > 0:
+        score = image_score_corner_masked(anomaly_map, corner_size=corner_size).item()
+    else:
+        score = image_score_from_map(anomaly_map, border_margin=border_margin).item()
+    return score, anomaly_map
 
 def save_confusion_map(img_tensor, mask_tensor, anomaly_map_tensor, save_path, global_min=0.0, global_max=1.0, threshold=0.5):
     """
@@ -208,7 +216,7 @@ def evaluate_and_save_maps(args):
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], args.res)
             
-            score, anomaly_map = compute_image_anomaly_score_and_map(inputs, outputs, image_size)
+            score, anomaly_map = compute_image_anomaly_score_and_map(inputs, outputs, image_size, border_margin=args.border_margin, corner_size=args.corner_size)
             
             # Store everything on CPU to avoid GPU OOM on large datasets
             results_memory.append({
@@ -288,7 +296,10 @@ def evaluate_and_save_maps(args):
     print("=" * 50)
     print(" EVALUATION METRICS REPORT ")
     print("=" * 50)
-    
+    print(f"border_margin={args.border_margin}  corner_size={args.corner_size}  "
+          f"({'comportamento invariato' if args.border_margin == 0 and args.corner_size == 0 else 'ATTIVO'})")
+    print("-" * 50)
+
     print("--- SAMPLE LEVEL (Image Classification) ---")
     print(f"Optimal Threshold: {best_threshold_raw:.4f}")
     print(f"AUROC:             {auroc_sp:.4f}")
@@ -359,6 +370,12 @@ if __name__ == '__main__':
     parser.add_argument('--seg', default=1, type=int, help='0 for no segmentation, 1 with segmentation masks')
     parser.add_argument('--res', default=3, type=int, help='Skip connection parameter used during training')
     parser.add_argument('--net', default='wide_res50', type=str, help='Network architecture')
+    parser.add_argument('--border_margin', default=0, type=int,
+                         help='Pixel esclusi dall\'intera fascia di bordo nel calcolo dello score. '
+                              '0 = comportamento invariato. DA VALIDARE.')
+    parser.add_argument('--corner_size', default=0, type=int,
+                         help='Pixel esclusi SOLO nei 4 angoli (piu\' chirurgico di --border_margin). '
+                              '0 = comportamento invariato. DA VALIDARE.')
     
     args = parser.parse_args()
     evaluate_and_save_maps(args)
