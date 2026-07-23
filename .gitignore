@@ -10,3 +10,4 @@ tuning_imgs
 tuning_ckpoints
 sk_rd4ad_tuning.db
 exports/
+hyperparameter_finetuning/
