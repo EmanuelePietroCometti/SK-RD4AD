@@ -15,6 +15,35 @@ import json
 from dataset.dataset import get_data_transforms, MVTecDataset, MVTecDataset_no_seg
 from model.resnet import resnet18, resnet34, resnet50, wide_resnet50_2
 from model.de_resnet import de_resnet18, de_resnet34, de_wide_resnet50_2, de_resnet50
+import seaborn as sns
+
+def save_confusion_matrix_plot(cm, save_path, class_names=('Normal', 'Anomalous'),
+                               title='Confusion Matrix (Sample Level)'):
+    """
+    Salva la confusion matrix sample-level come heatmap seaborn.
+    Ogni cella riporta il conteggio assoluto e la percentuale sulla riga
+    (cioè sul totale dei campioni di quella classe reale).
+    """
+    cm = np.asarray(cm)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_perc = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float),
+                        where=row_sums != 0) * 100.0
+
+    annot = np.empty_like(cm).astype(str)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            annot[i, j] = f"{cm[i, j]}\n({cm_perc[i, j]:.1f}%)"
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    sns.heatmap(cm, annot=annot, fmt='', cmap='Blues', cbar=True,
+                square=True, linewidths=0.5, linecolor='white',
+                xticklabels=class_names, yticklabels=class_names, ax=ax)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Ground Truth')
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
 
 def compute_image_anomaly_score_and_map(inputs, outputs, image_size):
     """
@@ -285,46 +314,40 @@ def evaluate_and_save_maps(args):
     # ---------------------------------------------------------
     # PRINT EVALUATION REPORT
     # ---------------------------------------------------------
-    print("=" * 50)
-    print(" EVALUATION METRICS REPORT ")
-    print("=" * 50)
-    
-    print("--- SAMPLE LEVEL (Image Classification) ---")
-    print(f"Optimal Threshold: {best_threshold_raw:.4f}")
-    print(f"AUROC:             {auroc_sp:.4f}")
-    print(f"Accuracy:          {acc_sp:.4f}")
-    print(f"F1-Score:          {f1_sp:.4f}")
-    print(f"Precision:         {prec_sp:.4f}")
-    print(f"Recall:            {rec_sp:.4f}")
-    print("Confusion Matrix (TN, FP | FN, TP):")
-    print(cm)
-    
-    if args.seg == 1:
-        print("\n--- PIXEL LEVEL (Defect Localization) ---")
-        print(f"AUPRO:             {aupro:.4f}")
-        print(f"AP-loc:            {ap_loc:.4f}")
-        print(f"Pixel AUROC:       {auroc_px:.4f}")
-    print("=" * 50)
+    lines = []
+    lines.append("=" * 50)
+    lines.append(" EVALUATION METRICS REPORT ")
+    lines.append("=" * 50)
 
-    # Persist the calibration so it can travel with the model and be
-    # cross-checked against calibrate_threshold.py (the ONNX-pipeline
-    # calibration): with the canonical pipeline the two must agree up to
-    # floating-point drift.
-    calibration = {
-        "pipeline": "dynamic_crop -> sum(1-cos, align_corners=False) -> gauss_k15_sigma4_zeropad -> max",
-        "source": "eval.py (PyTorch reference)",
-        "checkpoint": os.path.basename(args.checkpoint_path),
-        "class": args.class_,
-        "threshold": float(best_threshold_raw),
-        "global_min": float(global_min),
-        "global_max": float(global_max),
-        "auroc_sp": float(auroc_sp),
-        "f1_sp": float(f1_sp),
-    }
-    calib_path = os.path.join(args.img_path, "calibration_pytorch.json")
-    with open(calib_path, "w") as f:
-        json.dump(calibration, f, indent=2)
-    print(f"Calibration saved to {calib_path}")
+    lines.append("--- SAMPLE LEVEL (Image Classification) ---")
+    lines.append(f"Optimal Threshold: {best_threshold_raw:.4f}")
+    lines.append(f"AUROC:             {auroc_sp:.4f}")
+    lines.append(f"Accuracy:          {acc_sp:.4f}")
+    lines.append(f"F1-Score:          {f1_sp:.4f}")
+    lines.append(f"Precision:         {prec_sp:.4f}")
+    lines.append(f"Recall:            {rec_sp:.4f}")
+
+    if args.seg == 1:
+        lines.append("")
+        lines.append("--- PIXEL LEVEL (Defect Localization) ---")
+        lines.append(f"AUPRO:             {aupro:.4f}")
+        lines.append(f"AP-loc:            {ap_loc:.4f}")
+        lines.append(f"Pixel AUROC:       {auroc_px:.4f}")
+
+    lines.append("=" * 50)
+
+    report = "\n".join(lines)
+
+    # Print to stdout
+    print(report)
+
+    # Save to file
+    os.makedirs(args.img_path, exist_ok=True)
+    report_path = os.path.join(args.img_path, "report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report + "\n")
+
+    print(f"\nReport saved to: {report_path}")
 
     print("\nPhase 2/2: Saving visualizations categorized by Confusion Matrix...")
     for res in results_memory:
@@ -347,8 +370,13 @@ def evaluate_and_save_maps(args):
         # The function will internally handle scaling the background to blue 
         # and forcing the image's specific defect to deep red.
         save_confusion_map(res['img'], res['mask'], res['anomaly_map'], save_path, global_min, global_max, best_threshold_raw)
-        
     print(f"Done! Evaluated images sorted in {args.img_path}")
+    cm_path = os.path.join(args.img_path, "confusion_matrix.png")
+    save_confusion_matrix_plot(
+        cm, cm_path,
+        title=f"Confusion Matrix — {args.class_} (thr={best_threshold_raw:.4f})"
+    )
+    print(f"Confusion matrix saved to {cm_path}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Evaluate and categorize Anomaly Maps")

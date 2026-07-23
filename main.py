@@ -98,20 +98,28 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, save_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed): 
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name): 
     image_size = 256
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
     print(class_)
-    if not os.path.exists(save_path):
-        os.mkdir(save_path)
+    if not os.path.exists(ckpt_path):
+        os.mkdir(ckpt_path)
+        # Resolve the project name template (no-op if it contains no placeholders)
+    if img_path:
+        os.makedirs(img_path, exist_ok=True)
+    run_name = project_name.format(
+        net=net, res=res, class_=class_, lr=learning_rate, seed=seed
+    )
+
+    os.makedirs(ckpt_path, exist_ok=True)
+    ckpt_prefix = os.path.join(ckpt_path, run_name)
     data_transform, gt_transform = get_data_transforms(image_size, image_size) 
     data_transform = data_transform.to(device)
     gt_transform = gt_transform.to(device)
 
     train_path = data_path + class_ + '/train'
     test_path = data_path + class_ 
-    ckp_path = save_path + net + class_ 
 
     train_data = ImageFolder(root=train_path, loader=raw_tensor_loader)
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
@@ -252,7 +260,10 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
                 if current_auroc_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
-                    torch.save({'bn': bn.state_dict(),'decoder': decoder.state_dict()}, ckp_path + str(epoch+1) + str(seed) + 'sample_auc=' + str(auroc_sp) + '.pth')
+                    torch.save(
+                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
+                        f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth",
+                    )
                     best_avg_score = current_auroc_score
                     best_metrics = (auroc_sp,)
                
@@ -290,8 +301,10 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
                 if current_avg_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
-                    torch.save({'bn': bn.state_dict(),'decoder': decoder.state_dict()}, ckp_path + str(epoch+1) + str(seed) + 'sample_auc=' + str(auroc_sp) + '.pth')
-                    
+                    torch.save(
+                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
+                        f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth",
+                    )
                     best_avg_score = current_avg_score
                     
                     best_metrics = (auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px)
@@ -308,7 +321,8 @@ if __name__ == '__main__':
     parser.add_argument('--seg', default=0, type=int)  # Choose whether segmentation is needed
     parser.add_argument('--print_epoch', default=50, type=int)  # Print every few epochs
     parser.add_argument('--data_path', default='/home/intern24/mvtec/', type=str)  # Path to dataset folder
-    parser.add_argument('--save_path', default='/home/intern24/anomaly_checkpoints/dat_train2/skipconnection/', type=str)  # Path to save model files
+    parser.add_argument('--ckpt_path', default='/home/intern24/anomaly_checkpoints/dat_train2/skipconnection/', type=str)  # Path to save model files
+    parser.add_argument('--project_name', default='skrd4ad_{net}_{res}_{class_}_{lr}', type=str)  # Project name to save the results
     parser.add_argument('--print_canshu', default=1, type=int)  # Whether to print anomaly scores for test set
     parser.add_argument('--score_num', default=1, type=int)  # Number of anomaly scores used in the final anomaly score
     parser.add_argument('--print_loss', default=1, type=int)
@@ -341,7 +355,7 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed)
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name)
             print('*************************')  
 
     if args.class_ != 'all':
@@ -349,5 +363,5 @@ if __name__ == '__main__':
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.save_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed)
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name)
                 print('*************************') 
