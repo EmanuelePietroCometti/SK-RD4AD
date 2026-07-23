@@ -5,10 +5,10 @@ Why this exists
 ---------------
 A threshold is only valid for the exact pipeline that produced the scores it
 was computed on. This script therefore runs the PRODUCTION pipeline end to
-end — canonical preprocessing (resize 256 -> [0,1] -> dynamic crop ->
-ImageNet normalize, identical to main.py's training loop) followed by the
-exported ONNX graph (contract 2.0: blur and score baked in) — over a labeled
-MVTec-style test set, and derives:
+end — canonical host preprocessing (resize 256 -> [0,1] -> dynamic crop,
+identical to main.py's training loop; ImageNet normalization is in-graph under
+contract 3.0) followed by the exported ONNX graph (contract 3.0: normalize +
+blur + score baked in) — over a labeled MVTec-style test set, and derives:
 
     - the F1-optimal image-level threshold (same criterion as eval.py),
     - global_min / global_max of the blurred maps (for eval.py-style
@@ -53,14 +53,14 @@ def load_session(model_path):
     import onnxruntime as ort
 
     meta = {p.key: p.value for p in onnx.load(model_path).metadata_props}
-    score_source = meta.get("score_source")
-    if score_source != "graph":
+    contract = meta.get("export_contract")
+    if contract != "3.0":
         sys.exit(
-            f"ERROR: model has score_source={score_source!r}, expected 'graph' "
-            "(anomaly_export_contract 2.0, blur baked into the graph).\n"
+            f"ERROR: model has export_contract={contract!r}, expected '3.0' "
+            "(normalization + blur + score all baked into the graph).\n"
             "Re-export the checkpoint with the current "
             "export_onnx_from_checkpoint.py: a threshold calibrated here would "
-            "not apply to a contract-1.0 model (its score is un-blurred)."
+            "not apply to an older-contract model (different input/score semantics)."
         )
     if meta.get("weights_source") == "random_self_test":
         sys.exit("ERROR: refusing to calibrate a --self_test model (random weights).")
@@ -71,19 +71,21 @@ def load_session(model_path):
 
 
 def canonical_preprocess(img):
-    """Dataset tensors arrive already resized+normalized; the dynamic crop must
-    run on the [0,1] image (main.py convention): denormalize -> crop -> renorm."""
+    """Dataset tensors arrive already resized+normalized. Contract 3.0's graph
+    input is the [0,1] image (normalization is IN-GRAPH), and the dynamic crop
+    runs on that [0,1] image (main.py convention): denormalize -> crop. Do NOT
+    renormalize here — the graph's InGraphNormalize would then normalize twice
+    (the exact AUROC-crashing bug the in-graph normalization exists to prevent)."""
     mean_t = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     std_t = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
     img = (img * std_t + mean_t).clamp(0, 1)
-    img = apply_dynamic_crop_gpu(img)
-    return (img - mean_t) / std_t
+    return apply_dynamic_crop_gpu(img)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", required=True, help="Path to the .onnx model (contract 2.0)")
+    p.add_argument("--model", required=True, help="Path to the .onnx model (contract 3.0)")
     p.add_argument("--data_path", default="./mvtec/", help="Dataset root")
     p.add_argument("--class_", required=True, help="Dataset class (subfolder of data_path)")
     p.add_argument("--seg", default=1, type=int, choices=[0, 1],
@@ -114,7 +116,7 @@ def main():
         img = canonical_preprocess(img)
 
         amap, score = sess.run(["anomaly_map", "anomaly_score"],
-                               {"input_tensor": img.numpy().astype(np.float32)})
+                               {"image": img.numpy().astype(np.float32)})
         y_true.append(int(label.item()))
         scores.append(float(score[0]))
         map_mins.append(float(amap.min()))

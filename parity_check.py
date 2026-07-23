@@ -2,12 +2,14 @@
 parity_check.py — Verify that the PyTorch reference pipeline and the exported
 ONNX graph produce the same anomaly maps and scores on REAL images.
 
-Both paths receive the identical canonically-preprocessed tensor (resize ->
-[0,1] -> dynamic crop -> ImageNet normalize); the PyTorch side then applies
-test.py's canonical map definition (compute_anomaly_map_torch), the ONNX side
-runs the contract-2.0 graph, which bakes the same definition in. Any gap
-beyond floating-point kernel differences (~1e-4) means the two pipelines have
-drifted — do not ship the model until this passes.
+Both paths share the same host preprocessing up to the [0,1] dynamic-cropped
+image (resize -> [0,1] -> dynamic crop). Under contract 3.0 normalization is
+in-graph, so the ONNX side is fed the [0,1] image and normalizes internally,
+while the PyTorch reference is fed the normalized tensor and applies test.py's
+canonical map definition (compute_anomaly_map_torch); the graph bakes the same
+definition (normalize + cosine map + blur + score) in. Any gap beyond
+floating-point kernel differences (~1e-4) means the two pipelines have drifted —
+do not ship the model until this passes.
 
 Bit-exact equality is impossible (PyTorch and onnxruntime use different conv
 kernels); the pass criterion is max |Δ| < 1e-3 on both map and score, in fp32.
@@ -62,8 +64,8 @@ def main():
     import onnx
     import onnxruntime as ort
     meta = {m.key: m.value for m in onnx.load(args.model).metadata_props}
-    if meta.get("score_source") != "graph":
-        sys.exit("ERROR: model is not contract 2.0 (score_source != 'graph'); "
+    if meta.get("export_contract") != "3.0":
+        sys.exit("ERROR: model is not contract 3.0 (export_contract != '3.0'); "
                  "re-export with the current export_onnx_from_checkpoint.py.")
     if str(meta.get("res", args.res)) != str(args.res):
         sys.exit(f"ERROR: model was exported with res={meta.get('res')} but "
@@ -95,21 +97,24 @@ def main():
                 break
             img = batch[0].to(device)
 
-            # Canonical preprocessing, ONCE, shared by both paths.
-            img = (img * std_t + mean_t).clamp(0, 1)
-            img = apply_dynamic_crop_gpu(img)
-            img = (img - mean_t) / std_t
+            # Canonical host preprocessing: denormalize -> [0,1] -> dynamic crop.
+            # Under contract 3.0 the ONNX graph receives this [0,1] image and
+            # normalizes internally (InGraphNormalize); the PyTorch reference
+            # encoder expects the normalized tensor, so it is normalized here.
+            img01 = (img * std_t + mean_t).clamp(0, 1)
+            img01 = apply_dynamic_crop_gpu(img01)
+            img_norm = (img01 - mean_t) / std_t
 
-            # PyTorch path
-            inputs = encoder(img)
+            # PyTorch path (normalized input)
+            inputs = encoder(img_norm)
             outputs = decoder(bn(inputs), inputs[0:3], args.res)
             t_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, IMG_SIZE)
             t_map = t_map.cpu().numpy()
             t_score = float(t_map.max())
 
-            # ONNX path (same tensor)
+            # ONNX path (contract 3.0: [0,1] input, normalization in-graph)
             o_map, o_score = sess.run(["anomaly_map", "anomaly_score"],
-                                      {"input_tensor": img.cpu().numpy().astype(np.float32)})
+                                      {"image": img01.cpu().numpy().astype(np.float32)})
 
             d_map = float(np.abs(o_map - t_map).max())
             d_score = float(abs(float(o_score[0]) - t_score))
