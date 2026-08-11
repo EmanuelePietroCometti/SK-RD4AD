@@ -187,10 +187,6 @@ def evaluate_and_save_maps(args):
 
     results_memory = []
 
-    # Tensors for the canonical denormalize -> crop -> renormalize step
-    mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
     print("Phase 1/2: Extracting anomaly scores and spatial maps...")
     with torch.no_grad():
         for idx, batch in enumerate(test_dataloader):
@@ -220,18 +216,13 @@ def evaluate_and_save_maps(args):
                 else:
                     raise RuntimeError("Dataset returned neither a label nor a mask.")
             
-            # Canonical preprocessing, identical to the training loop (main.py)
-            # and to what the inference runtime does: the dynamic crop operates
-            # on the DENORMALIZED [0,1] image (its 0.94 background threshold is
-            # defined there), then the crop is renormalized for the encoder.
-            # Without this crop the threshold computed below would live on a
-            # different score distribution than production inference.
-            img = (img * std_t + mean_t).clamp(0, 1)
-            if mask is not None:
-                img, mask = apply_dynamic_crop_gpu(img, masks=mask)
-            else:
-                img = apply_dynamic_crop_gpu(img)
-            img = (img - mean_t) / std_t
+            # NOTE (ONNX/deployment parity): the content-dependent dynamic crop
+            # (apply_dynamic_crop_gpu, 0.94 background threshold) was REMOVED.
+            # It cannot be baked into a static ONNX graph, so keeping it here would
+            # compute the decision threshold on a score distribution the exported
+            # model cannot reproduce. The image is now fed to the encoder exactly as
+            # the export pipeline preprocesses it (resize + in-graph normalize, no
+            # crop). See the thesis note on preprocessing parity.
 
             # Forward pass
             inputs = encoder(img)
@@ -268,7 +259,27 @@ def evaluate_and_save_maps(args):
     
     # Generate binary predictions based on the optimal threshold
     y_pred = (raw_scores >= best_threshold_raw).astype(int)
-    
+
+    # --- Persist calibration as a sidecar next to the checkpoint (for ONNX export) ---
+    # Carries the SAME reported threshold + score/map range so the exporter inherits
+    # the exact operating point. normalization_formula=anomalib_centered => the
+    # downstream decision threshold is 0.5. Zero change to the reported numbers.
+    calib = {
+        "image_threshold_raw": float(best_threshold_raw),
+        "pixel_threshold_raw": float(best_threshold_raw),
+        "score_min_raw": float(raw_scores.min()),
+        "score_max_raw": float(raw_scores.max()),
+        "map_min_raw": float(global_min),
+        "map_max_raw": float(global_max),
+        "normalization_formula": "anomalib_centered",
+        "calibration_split": "test",
+        "calibration_method": "f1_optimal",
+    }
+    calib_path = args.checkpoint_path + ".calib.json"
+    with open(calib_path, "w", encoding="utf-8") as f:
+        json.dump(calib, f, indent=2)
+    print(f"[calib] wrote sidecar: {calib_path}")
+
     # Calculate sample-level classification metrics
     auroc_sp = roc_auc_score(y_true, raw_scores)
     cm = confusion_matrix(y_true, y_pred)
