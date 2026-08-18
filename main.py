@@ -16,6 +16,9 @@ from torchvision.transforms.v2 import functional as F_v2
 import torch.nn.functional as F
 import cv2
 
+from aug_config import AugConfig
+from augment_sk import build_gpu_augmentation
+
 from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
 
 def raw_tensor_loader(path):
@@ -98,7 +101,7 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name): 
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None):
     image_size = 256
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
@@ -180,13 +183,11 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     best_avg_score = 0
     best_metrics = None  # stays None if no evaluation ever improves the score
 
-    # Define v2 pipeline (executed directly on GPU tensors)
-    gpu_transforms = v2.Compose([
-        v2.RandomAffine(degrees=[-10.0, 10.0], translate=[0.02, 0.02], scale=[0.98, 1.02], fill=1.0, interpolation=v2.InterpolationMode.BILINEAR),
-        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
-        v2.RandomGrayscale(p=0.2),
-        v2.RandomApply([v2.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.4)
-    ])
+    # Build the (optional) augmentation pipeline from config. None => no augmentation.
+    if aug_cfg is None:
+        aug_cfg = AugConfig()  # enabled=False: clean baseline
+    aug = build_gpu_augmentation(aug_cfg)
+    print(f"[AUG] {aug_cfg.to_dict()}")
 
     # Tensors for denormalization/normalization on device
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -202,25 +203,28 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             img = data_transform(img)
 
             # ==========================================
-            # INLINE GPU AUGMENTATION BLOCK
+            # CONFIGURABLE GPU AUGMENTATION BLOCK
             # ==========================================
-            # Denormalize to [0, 1] range for color operations
-            img = img * std_t + mean_t
-            img = img.clamp(0, 1)
-            
-            # Apply Dynamic Crop (Always active to normalize object scale)
-            img = apply_dynamic_crop_gpu(img)
+            if aug is not None or aug_cfg.dynamic_crop or aug_cfg.equalize_p > 0 or aug_cfg.speckle_std > 0:
+                # Denormalize to [0, 1] for color/spatial operations
+                img = img * std_t + mean_t
+                img = img.clamp(0, 1)
 
-            # Apply Equalization (50% probability) — CPU rng, avoids a GPU sync per batch
-            if random.random() < 0.5:
-                img_uint8 = (img * 255.0).to(torch.uint8)
-                img = F_v2.equalize(img_uint8).to(torch.float32) / 255.0
+                if aug_cfg.dynamic_crop:
+                    img = apply_dynamic_crop_gpu(img)
 
-            # Standard spatial and color transformations
-            img = gpu_transforms(img)
+                if aug_cfg.equalize_p > 0 and random.random() < aug_cfg.equalize_p:
+                    img_uint8 = (img * 255.0).to(torch.uint8)
+                    img = F_v2.equalize(img_uint8).to(torch.float32) / 255.0
 
-            # Renormalize back to ImageNet standard for ResNet encoder
-            img = (img - mean_t) / std_t
+                if aug is not None:
+                    img = aug(img)
+
+                if aug_cfg.speckle_std > 0:
+                    img = (img + torch.randn_like(img) * aug_cfg.speckle_std).clamp(0, 1)
+
+                # Renormalize back to ImageNet standard for the frozen encoder
+                img = (img - mean_t) / std_t
             # ==========================================
 
             # The encoder is frozen: skip autograd graph construction for it
@@ -334,7 +338,10 @@ if __name__ == '__main__':
     parser.add_argument('--print_max', default=1, type=int)  # Whether to print the best AUC
     parser.add_argument('--net', default='wide_res50', type=str)  # Available net types, can choose res18, res34, res50, wide_res50
     parser.add_argument('--L2', default=0, type=int)  # Whether to use L2 loss function
+    parser.add_argument('--aug-config', dest='aug_config', default=None, type=str)  # path to AugConfig JSON; None => baseline
     args = parser.parse_args()
+
+    aug_cfg = AugConfig.from_json(args.aug_config) if args.aug_config else AugConfig()
 
     print('--------args----------')
     for k in list(vars(args).keys()):
@@ -355,7 +362,7 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name)
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg)
             print('*************************')  
 
     if args.class_ != 'all':
@@ -363,5 +370,5 @@ if __name__ == '__main__':
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name)
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg)
                 print('*************************') 
