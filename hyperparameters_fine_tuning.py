@@ -3,6 +3,7 @@ import argparse
 from main import train, setup_seed
 import os
 import torch
+from aug_config import AugConfig
 
 # Add 'args' as a parameter to receive values from the command line
 def objective(trial, args):
@@ -13,7 +14,6 @@ def objective(trial, args):
     layer_loss = trial.suggest_categorical('layerloss', [0, 1])
     L2 = trial.suggest_categorical('L2', [0, 1, 2])
     net = trial.suggest_categorical('net', ['res18', 'res34', 'res50', 'wide_res50'])
-    cut = trial.suggest_int('cut', 0, 1)
 
     if layer_loss == 1:
         rate = trial.suggest_categorical('rate', [0.1, 0.5, 1.0]) 
@@ -31,6 +31,8 @@ def objective(trial, args):
     print_epoch = 5
     seg = 1 # CRITICAL: must be 1 for Pixel F1 evaluation
 
+    aug_cfg = AugConfig.from_json("configs/aug_legacy.json") if args.aug_config else AugConfig()
+
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(img_path, exist_ok=True)
     setup_seed(seed)
@@ -41,8 +43,8 @@ def objective(trial, args):
             class_=class_, epochs=epochs, learning_rate=learning_rate, res=res, 
             batch_size=batch_size, print_epoch=print_epoch, seg=seg, 
             data_path=data_path, save_path=save_path, print_canshu=0, 
-            score_num=1, print_loss=0, img_path=img_path, vis=0, cut=cut, 
-            layerloss=layer_loss, rate=rate, print_max=0, net=net, L2=L2, seed=seed
+            score_num=1, print_loss=0, img_path=img_path, vis=0, cut=0, 
+            layerloss=layer_loss, rate=rate, print_max=0, net=net, L2=L2, seed=seed, aug_cfg=aug_cfg
         )
         
         # COMBINED METRIC CALCULATION (50/50 Weighting)
