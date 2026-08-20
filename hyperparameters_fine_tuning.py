@@ -26,35 +26,44 @@ def objective(trial, args):
     data_path = args.data_path
     save_path = args.save_path
     img_path = "./tuning_imgs/"
+
+    current_ckpt_path = save_path 
+    current_project_name = f"trial_{trial.number}"
     
     epochs = 30
     print_epoch = 5
-    seg = 1 # CRITICAL: must be 1 for Pixel F1 evaluation
+    seg = 1 
 
-    aug_cfg = AugConfig.from_json("configs/aug_legacy.json") if args.aug_config else AugConfig()
+    aug_cfg = AugConfig.from_json("configs/aug_legacy.json")
 
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(img_path, exist_ok=True)
     setup_seed(seed)
 
-    # Execute the optimization
     try:
-        auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp, optimal_f1_px = train(
+        # Assign output to a single variable first to safely check for None
+        metrics = train(
             class_=class_, epochs=epochs, learning_rate=learning_rate, res=res, 
             batch_size=batch_size, print_epoch=print_epoch, seg=seg, 
-            data_path=data_path, save_path=save_path, print_canshu=0, 
+            data_path=data_path, print_canshu=0, 
             score_num=1, print_loss=0, img_path=img_path, vis=0, cut=0, 
-            layerloss=layer_loss, rate=rate, print_max=0, net=net, L2=L2, seed=seed, aug_cfg=aug_cfg
+            layerloss=layer_loss, rate=rate, print_max=0, net=net, L2=L2, 
+            seed=seed, aug_cfg=aug_cfg, 
+            ckpt_path=current_ckpt_path,
+            project_name=current_project_name
         )
         
-        # COMBINED METRIC CALCULATION (50/50 Weighting)
+        if metrics is None:
+            raise optuna.exceptions.TrialPruned("Training failed: best_metrics remained None.")
+            
+        auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp, optimal_f1_px = metrics
+        
         alpha = 0.5
         combined_f1 = (alpha * optimal_f1_sp) + ((1 - alpha) * optimal_f1_px)
         
         print(f"\n[Trial {trial.number} Results] F1 Sample: {optimal_f1_sp:.3f} | F1 Pixel: {optimal_f1_px:.3f} | COMBINED: {combined_f1:.3f}\n")
 
     except RuntimeError as e:
-        # Prune the trial if CUDA runs out of memory
         if "out of memory" in str(e):
             torch.cuda.empty_cache()
             raise optuna.exceptions.TrialPruned()
