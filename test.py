@@ -20,7 +20,7 @@ from matplotlib.ticker import NullFormatter
 from scipy.spatial.distance import pdist
 from sklearn.metrics import (roc_auc_score, average_precision_score, 
                              precision_recall_curve, f1_score, 
-                             precision_score, recall_score)
+                             precision_score, recall_score, accuracy_score)
 import matplotlib
 import pickle
 import os
@@ -28,6 +28,7 @@ from skimage.segmentation import mark_boundaries
 from torchvision.transforms.functional import normalize
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F_v2
+import shutil
 
 plt.switch_backend('agg')
 
@@ -203,7 +204,7 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
     std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
     with torch.no_grad():
-        for (img, label, _) in dataloader:
+        for (img, label, _, _) in dataloader:
             img = img.to(device)
 
             # Denormalize, Crop, Renormalize
@@ -298,53 +299,83 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, prin
             count += 1
 
 # Generate heatmaps for evaluation visualization without segmentation
-def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, device, print_canshu, score_num, img_path):
-    count = 0
-    decoder.eval()
-    bn.eval()
+def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, device,
+                                    score_num, img_path,
+                                    threshold=None,
+                                    save_panel=True, nest_by_type=True):
+    decoder.eval(); bn.eval(); encoder.eval()
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    with torch.no_grad():
-        for img, label, _  in dataloader:
-            if (label.item() == 0):
-                continue
-            img = img.to(device)
+    std_t  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-            # Canonical preprocessing: denormalize -> dynamic crop -> renormalize
+    records = []
+    with torch.no_grad():
+        for img, label, img_type, paths in dataloader:
+            img = img.to(device)
             img = (img * std_t + mean_t).clamp(0, 1)
             img = apply_dynamic_crop_gpu(img)
-            img = (img - mean_t) / std_t
+            img_norm = (img - mean_t) / std_t
 
-            inputs = encoder(img)
-            outputs = decoder(bn(inputs), inputs[0:3], res)  
+            inputs = encoder(img_norm)
+            outputs = decoder(bn(inputs), inputs[0:3], res)
+            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
 
-            anomaly_map, amap_list = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')  # Generate anomaly map
-            
-            ano_map = min_max_norm(anomaly_map)  # Normalize data
+            flat = anomaly_map.reshape(img.shape[0], -1)
+            top_scores = np.sort(flat, axis=1)[:, -score_num:].mean(axis=1)
 
-            ano_map = cvt2heatmap(255-ano_map*255)  # Convert to heatmap
-            img = cv2.cvtColor(img.permute(0, 2, 3, 1).cpu().numpy()[0] * 255, cv2.COLOR_BGR2RGB)
+            for i in range(img.shape[0]):
+                records.append((int(label[i].item()), float(top_scores[i]),
+                                img[i].cpu().numpy(), anomaly_map[i],
+                                img_type[i], paths[i]))
 
-            img = np.uint8(min_max_norm(img)*255)
-            ano_map = show_cam_on_image(img, ano_map)  # Overlay heatmap on original image
+    labels = np.array([r[0] for r in records])
+    scores = np.array([r[1] for r in records])
 
-            # Plot heatmap
-            plt.subplot(1,2,1)
-            plt.imshow(ano_map)
-            plt.axis('off')
+    if threshold is None:
+        prec, rec, thr = precision_recall_curve(labels, scores)
+        f1 = (2 * prec * rec) / (prec + rec + 1e-10)
+        threshold = float(thr[min(np.argmax(f1), len(thr) - 1)])
 
-            # Plot original image
-            plt.subplot(1,2,2)
-            plt.imshow(img)
-            plt.axis('off')
+    preds = (scores >= threshold).astype(int)
 
-            if (os.path.exists(img_path) == 0):
-                os.mkdir(img_path)
+    metrics = {
+        'auroc':     round(roc_auc_score(labels, scores), 4) if len(np.unique(labels)) >= 2 else float('nan'),
+        'ap':        round(average_precision_score(labels, scores), 4) if len(np.unique(labels)) >= 2 else float('nan'),
+        'f1':        round(f1_score(labels, preds, zero_division=0), 4),
+        'precision': round(precision_score(labels, preds, zero_division=0), 4),
+        'recall':    round(recall_score(labels, preds, zero_division=0), 4),
+        'accuracy':  round(accuracy_score(labels, preds), 4),
+        'balanced_accuracy': round((recall_score(labels, preds, zero_division=0) +
+                                    recall_score(1 - labels, 1 - preds, zero_division=0)) / 2, 4),
+    }
 
-            # Save image
-            plt.savefig(img_path + str(count).replace('/', '_') + '.png')
+    cm = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
 
-            count += 1
+    for (lab, sc, rgb01, amap, dtype, path), pred in zip(records, preds):
+        if   lab == 1 and pred == 1: sub = 'tp'
+        elif lab == 0 and pred == 0: sub = 'tn'
+        elif lab == 0 and pred == 1: sub = 'fp'
+        else:                        sub = 'fn'
+        cm[sub] += 1
+
+        out_dir = os.path.join(img_path, sub, dtype) if nest_by_type else os.path.join(img_path, sub)
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out = os.path.join(out_dir, stem + '.png')
+
+        if save_panel:
+            heat = cvt2heatmap(255 - min_max_norm(amap) * 255)
+            rgb = np.transpose(rgb01, (1, 2, 0)) * 255
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            rgb = np.uint8(min_max_norm(rgb) * 255)
+            overlay = show_cam_on_image(rgb, heat)
+            fig = plt.figure()
+            plt.subplot(1, 2, 1); plt.imshow(overlay); plt.axis('off')
+            plt.subplot(1, 2, 2); plt.imshow(rgb);     plt.axis('off')
+            plt.savefig(out); plt.close(fig)
+        else:
+            shutil.copy(path, os.path.join(out_dir, os.path.basename(path)))
+
+    return cm, threshold, metrics
 
 # Evaluation with segmentation (GPU-accelerated with full metrics)
 def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):

@@ -18,6 +18,8 @@ import cv2
 
 from aug_config import AugConfig
 from augment_sk import build_gpu_augmentation
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
 
@@ -110,6 +112,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         os.mkdir(ckpt_path)
         # Resolve the project name template (no-op if it contains no placeholders)
     if img_path:
+        img_path = os.path.join(img_path, class_, f'seed_{seed}')
         os.makedirs(img_path, exist_ok=True)
     run_name = project_name.format(
         net=net, res=res, class_=class_, lr=learning_rate, seed=seed
@@ -181,6 +184,8 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     max_pr = []
     max_pr_epoch = []
     best_avg_score = 0
+    best_ckpt_path = None
+    best_epoch = None
     best_metrics = None  # stays None if no evaluation ever improves the score
 
     # Build the (optional) augmentation pipeline from config. None => no augmentation.
@@ -262,17 +267,14 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 # Save model only if Sample AUROC is the maximum
                 current_auroc_score = auroc_sp
 
-                if current_auroc_score > best_avg_score:
+                if auroc_sp > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
-                    torch.save(
-                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
-                        f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth",
-                    )
-                    best_avg_score = current_auroc_score
+                    best_ckpt = f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth"
+                    torch.save({'bn': bn.state_dict(), 'decoder': decoder.state_dict()}, best_ckpt)
+                    best_avg_score = auroc_sp
+                    best_epoch = epoch + 1
+                    best_ckpt_path = best_ckpt
                     best_metrics = (auroc_sp,)
-               
-                if vis == 1:  # Visualization output when no mask
-                    evaluation_visualization_no_seg(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
 
             # Test set with mask and need localization
             if seg == 1:
@@ -312,6 +314,40 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                     best_avg_score = current_avg_score
                     
                     best_metrics = (auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px)
+
+    if seg == 0 and vis == 1 and best_ckpt_path is not None:
+        state = torch.load(best_ckpt_path, map_location=device)
+        decoder.load_state_dict(state['decoder'])
+        bn.load_state_dict(state['bn'])
+
+        cm, thr, metrics = evaluation_visualization_no_seg(
+            encoder, bn, decoder, res, test_dataloader, device,
+            score_num, img_path)
+
+        cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm_mat, annot=True, fmt='d', cmap='Blues', cbar=True,
+                    xticklabels=['pred good', 'pred anom'],
+                    yticklabels=['true good', 'true anom'])
+        plt.ylabel('True'); plt.xlabel('Pred')
+        plt.title(f'Confusion Matrix (best ep{best_epoch}) @thr={thr:.4f}')
+        plt.savefig(os.path.join(img_path, 'confusion_matrix.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f'[best ckpt ep{best_epoch}] @thr={thr:.4f}  cm={cm}')
+        print(f'  AUROC={metrics["auroc"]}  F1={metrics["f1"]}  '
+              f'Precision={metrics["precision"]}  Average Precision={metrics["ap"]} Recall={metrics["recall"]}  '
+              f'Accuracy={metrics["accuracy"]} Balanced Acc={metrics["balanced_accuracy"]}')
+
+        with open(os.path.join(img_path, 'metrics.txt'), 'w') as f:
+            f.write(f'best_epoch\t{best_epoch}\n')
+            f.write(f'threshold\t{thr:.6f}\n')
+            for k, v in metrics.items():
+                f.write(f'{k}\t{v}\n')
+            for k, v in cm.items():
+                f.write(f'{k}\t{v}\n')
+
     return best_metrics
 
 if __name__ == '__main__':
