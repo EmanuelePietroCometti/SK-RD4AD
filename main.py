@@ -103,8 +103,7 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None):
-    image_size = 256
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None, image_size=256, image_isize=256):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
     print(class_)
@@ -375,6 +374,8 @@ if __name__ == '__main__':
     parser.add_argument('--net', default='wide_res50', type=str)  # Available net types, can choose res18, res34, res50, wide_res50
     parser.add_argument('--L2', default=0, type=int)  # Whether to use L2 loss function
     parser.add_argument('--aug-config', dest='aug_config', default=None, type=str)  # path to AugConfig JSON; None => baseline
+    parser.add_argument('--image-size', default=256, type=int, help='Size of the input images (height and width)')
+    parser.add_argument('--image-isize', default=256, type=int, help='Size of the input images for the encoder (height and width)')
     args = parser.parse_args()
 
     aug_cfg = AugConfig.from_json(args.aug_config) if args.aug_config else AugConfig()
@@ -398,7 +399,7 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg)
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize)
             print('*************************')  
 
     if args.class_ != 'all':
@@ -406,5 +407,5 @@ if __name__ == '__main__':
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg)
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize)
                 print('*************************') 
