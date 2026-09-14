@@ -279,11 +279,8 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
             # Test set with mask and need localization
             if seg == 1:
-                # Go through normal process
-                # Plot
-                if vis == 1:
-                    evaluation_visualization(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
-                # This part calculates the basic results and saves the results of the current epoch.
+                # Metrics only during training. Anomaly maps are generated once at
+                # the end, on the best checkpoint (see the post-training block).
                 auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
                 
                 print(f'Pixel AUROC: {auroc_px:.3f}, Sample AUROC: {auroc_sp:.3f}, AUPRO: {aupro:.3f}')
@@ -358,7 +355,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             for k, v in cm.items():
                 f.write(f'{k}\t{v}\n')
 
-    if seg == 1 and vis == 0 and best_ckpt_path is not None:
+    if seg == 1 and best_ckpt_path is not None:
         os.makedirs(img_path, exist_ok=True)
         
         state = torch.load(best_ckpt_path, map_location=device)
@@ -369,32 +366,34 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             encoder, bn, decoder, res, test_dataloader, device, img_path
         )
         
-        cm, _, _ = evaluation_visualization_no_seg(
-            encoder, bn, decoder, res, test_dataloader, device, score_num, img_path
-        )
-        cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
-        plt.figure(figsize=(6, 5))
-        sns.heatmap(cm_mat, annot=True, fmt='d', cmap='Blues', cbar=True,
-                    xticklabels=['pred good', 'pred anom'],
-                    yticklabels=['true good', 'true anom'])
-        plt.ylabel('True') 
-        plt.xlabel('Pred')
-        plt.title(f'Confusion Matrix (best ep{best_epoch}) @thr={thr:.4f}')
-        
-        plt.savefig(os.path.join(img_path, 'confusion_matrix.png'),
-                    dpi=300, bbox_inches='tight')
-        plt.close()
+        # Anomaly maps + GT overlays, generated once on the best checkpoint
+        if vis == 1:
+            cm, thr, cls_metrics = evaluation_visualization(
+                encoder, bn, decoder, res, test_dataloader, device,
+                print_canshu, score_num, img_path)
+
+            cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(cm_mat, annot=True, fmt='d', cmap='Blues', cbar=True,
+                        xticklabels=['pred good', 'pred anom'],
+                        yticklabels=['true good', 'true anom'])
+            plt.ylabel('True'); plt.xlabel('Pred')
+            plt.title(f'Confusion Matrix (best ep{best_epoch}) @thr={thr:.4f}')
+            plt.savefig(os.path.join(img_path, 'confusion_matrix.png'),
+                        dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f'[best ckpt ep{best_epoch}] @thr={thr:.4f}  cm={cm}')
 
         report_text = textwrap.dedent(f"""\
             ================ EVALUATION REPORT ================
-            AUROC (Pixel-level):          {auroc_px:.4f}
-            AUROC (Sample-level):         {auroc_sp:.4f}
-            AUPRO:                        {aupro:.4f}
-            AP (Localization):            {ap_loc:.4f}
-            Optimal F1 (Sample-level):    {optimal_f1_sp:.4f}
-            Optimal Precision (Sample):   {optimal_prec_sp:.4f}
-            Optimal Recall (Sample):      {optimal_rec_sp:.4f}
-            Optimal F1 (Pixel-level):     {optimal_f1_px:.4f}
+            AUROC (Pixel-level):            {auroc_px:.4f}
+            AUROC (Sample-level):           {auroc_sp:.4f}
+            AUPRO:                          {aupro:.4f}
+            AP (Localization):              {ap_loc:.4f}
+            F1 (Sample-level):              {optimal_f1_sp:.4f}
+            Precision (Sample):             {optimal_prec_sp:.4f}
+            Recall (Sample):                s{optimal_rec_sp:.4f}
+        F1 (Pixel-level):                   {optimal_f1_px:.4f}
             ===================================================
         """)
         print(report_text)

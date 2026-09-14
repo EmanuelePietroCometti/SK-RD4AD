@@ -235,68 +235,89 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
     
     return auroc_sp
 
-# Generate heatmaps for evaluation visualization
-def evaluation_visualization(encoder, bn, decoder, res, dataloader, device, print_canshu, score_num, img_path):
-    count = 0
-    decoder.eval()
-    bn.eval()
+# Generate heatmaps for evaluation visualization (segmentation version).
+# Mirrors evaluation_visualization_no_seg: images are bucketed into
+# tp/tn/fp/fn subfolders and the confusion matrix is returned to the caller.
+def evaluation_visualization(encoder, bn, decoder, res, dataloader, device,
+                             print_canshu, score_num, img_path,
+                             threshold=None, nest_by_type=True):
+    decoder.eval(); bn.eval(); encoder.eval()
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    std_t  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    records = []
     with torch.no_grad():
-        for img, gt, label, _, ip in dataloader:
-            print(ip[0][-20:-4])
-            if (label.item() == 0):
-                continue
+        for img, gt, label, img_type, ip in dataloader:   # batch_size must be 1
             img = img.to(device)
             gt = gt.to(device)
 
             # Canonical preprocessing: denormalize -> dynamic crop -> renormalize
             img = (img * std_t + mean_t).clamp(0, 1)
             img, gt = apply_dynamic_crop_gpu(img, masks=gt)
-            img = (img - mean_t) / std_t
+            img_norm = (img - mean_t) / std_t
 
-            inputs = encoder(img)
-            outputs = decoder(bn(inputs), inputs[0:3], res)  
+            inputs = encoder(img_norm)
+            outputs = decoder(bn(inputs), inputs[0:3], res)
 
-            anomaly_map, amap_list = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')  # Generate anomaly map
-            ano_map = min_max_norm(anomaly_map)  # Normalize data
+            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
+            gt = (gt > 0.5).float()
 
-            ano_map = cvt2heatmap(255-ano_map*255)  # Convert to heatmap
-            img = cv2.cvtColor(img.permute(0, 2, 3, 1).cpu().numpy()[0] * 255, cv2.COLOR_BGR2RGB)
+            # Image-level score = max of the blurred map: the same definition
+            # evaluation() uses, so this confusion matrix is consistent with the
+            # F1/precision/recall printed in the report.
+            records.append((int(label.item()), float(anomaly_map.max()),
+                            img[0].cpu().numpy(), anomaly_map,
+                            gt.cpu().numpy().astype(int)[0][0],
+                            img_type[0], ip[0]))
 
-            img = np.uint8(min_max_norm(img)*255)
-            ano_map = show_cam_on_image(img, ano_map)  # Overlay heatmap on original image
+    labels = np.array([r[0] for r in records])
+    scores = np.array([r[1] for r in records])
 
-            # Plot heatmap
-            plt.subplot(1,3,1)
-            plt.imshow(ano_map)
-            plt.axis('off')
+    if threshold is None:
+        prec, rec, thr = precision_recall_curve(labels, scores)
+        f1 = (2 * prec * rec) / (prec + rec + 1e-10)
+        threshold = float(thr[min(np.argmax(f1), len(thr) - 1)])
 
-            # Plot ground truth
-            gt = gt.cpu().numpy().astype(int)[0][0]*255
-            plt.subplot(1,3,2)
-            plt.imshow(gt, cmap='gray')
-            plt.axis('off')
+    preds = (scores >= threshold).astype(int)
 
-            # Plot original image
-            plt.subplot(1,3,3)
-            plt.imshow(img)
-            plt.axis('off')
+    metrics = {
+        'auroc':     round(roc_auc_score(labels, scores), 4) if len(np.unique(labels)) >= 2 else float('nan'),
+        'ap':        round(average_precision_score(labels, scores), 4) if len(np.unique(labels)) >= 2 else float('nan'),
+        'f1':        round(f1_score(labels, preds, zero_division=0), 4),
+        'precision': round(precision_score(labels, preds, zero_division=0), 4),
+        'recall':    round(recall_score(labels, preds, zero_division=0), 4),
+        'accuracy':  round(accuracy_score(labels, preds), 4),
+        'balanced_accuracy': round((recall_score(labels, preds, zero_division=0) +
+                                    recall_score(1 - labels, 1 - preds, zero_division=0)) / 2, 4),
+    }
 
-            if (os.path.exists(img_path) == 0):
-                os.mkdir(img_path)
+    cm = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
 
-            # Save image
-            original_name = os.path.basename(ip[0])
-            
-            # Split the name from its extension and append '.png'
-            name_without_ext = os.path.splitext(original_name)[0]
-            file_name_png = name_without_ext + '.png'
-            
-            # Save safely as a PNG file
-            plt.savefig(os.path.join(img_path, file_name_png))
+    for (lab, sc, rgb01, amap, gt_np, dtype, path), pred in zip(records, preds):
+        if   lab == 1 and pred == 1: sub = 'tp'
+        elif lab == 0 and pred == 0: sub = 'tn'
+        elif lab == 0 and pred == 1: sub = 'fp'
+        else:                        sub = 'fn'
+        cm[sub] += 1
 
-            count += 1
+        out_dir = os.path.join(img_path, sub, dtype) if nest_by_type else os.path.join(img_path, sub)
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out = os.path.join(out_dir, stem + '.png')
+
+        heat = cvt2heatmap(255 - min_max_norm(amap) * 255)
+        rgb = np.transpose(rgb01, (1, 2, 0)) * 255
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+        rgb = np.uint8(min_max_norm(rgb) * 255)
+        overlay = show_cam_on_image(rgb, heat)
+
+        fig = plt.figure()
+        plt.subplot(1, 3, 1); plt.imshow(overlay);            plt.axis('off')
+        plt.subplot(1, 3, 2); plt.imshow(gt_np * 255, cmap='gray'); plt.axis('off')
+        plt.subplot(1, 3, 3); plt.imshow(rgb);                plt.axis('off')
+        plt.savefig(out); plt.close(fig)
+
+    return cm, threshold, metrics
 
 # Generate heatmaps for evaluation visualization without segmentation
 def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, device,
