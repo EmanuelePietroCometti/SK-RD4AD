@@ -392,8 +392,8 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             AP (Localization):              {ap_loc:.4f}
             F1 (Sample-level):              {optimal_f1_sp:.4f}
             Precision (Sample):             {optimal_prec_sp:.4f}
-            Recall (Sample):                s{optimal_rec_sp:.4f}
-        F1 (Pixel-level):                   {optimal_f1_px:.4f}
+            Recall (Sample):                {optimal_rec_sp:.4f}
+            F1 (Pixel-level):               {optimal_f1_px:.4f}
             ===================================================
         """)
         print(report_text)
