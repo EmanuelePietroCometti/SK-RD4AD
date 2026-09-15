@@ -16,6 +16,13 @@ from torchvision.transforms.v2 import functional as F_v2
 import torch.nn.functional as F
 import cv2
 
+from aug_config import AugConfig
+from augment_sk import build_gpu_augmentation
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os 
+import textwrap
+
 from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
 
 def raw_tensor_loader(path):
@@ -98,8 +105,7 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name): 
-    image_size = 256
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None, image_size=256, image_isize=256):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
     print(class_)
@@ -107,6 +113,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         os.mkdir(ckpt_path)
         # Resolve the project name template (no-op if it contains no placeholders)
     if img_path:
+        img_path = os.path.join(img_path, class_, f'seed_{seed}')
         os.makedirs(img_path, exist_ok=True)
     run_name = project_name.format(
         net=net, res=res, class_=class_, lr=learning_rate, seed=seed
@@ -178,15 +185,15 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     max_pr = []
     max_pr_epoch = []
     best_avg_score = 0
+    best_ckpt_path = None
+    best_epoch = None
     best_metrics = None  # stays None if no evaluation ever improves the score
 
-    # Define v2 pipeline (executed directly on GPU tensors)
-    gpu_transforms = v2.Compose([
-        v2.RandomAffine(degrees=[-10.0, 10.0], translate=[0.02, 0.02], scale=[0.98, 1.02], fill=1.0, interpolation=v2.InterpolationMode.BILINEAR),
-        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
-        v2.RandomGrayscale(p=0.2),
-        v2.RandomApply([v2.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.4)
-    ])
+    # Build the (optional) augmentation pipeline from config. None => no augmentation.
+    if aug_cfg is None:
+        aug_cfg = AugConfig()  # enabled=False: clean baseline
+    aug = build_gpu_augmentation(aug_cfg)
+    print(f"[AUG] {aug_cfg.to_dict()}")
 
     # Tensors for denormalization/normalization on device
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -202,25 +209,28 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             img = data_transform(img)
 
             # ==========================================
-            # INLINE GPU AUGMENTATION BLOCK
+            # CONFIGURABLE GPU AUGMENTATION BLOCK
             # ==========================================
-            # Denormalize to [0, 1] range for color operations
-            img = img * std_t + mean_t
-            img = img.clamp(0, 1)
-            
-            # Apply Dynamic Crop (Always active to normalize object scale)
-            img = apply_dynamic_crop_gpu(img)
+            if aug is not None or aug_cfg.dynamic_crop or aug_cfg.equalize_p > 0 or aug_cfg.speckle_std > 0:
+                # Denormalize to [0, 1] for color/spatial operations
+                img = img * std_t + mean_t
+                img = img.clamp(0, 1)
 
-            # Apply Equalization (50% probability) — CPU rng, avoids a GPU sync per batch
-            if random.random() < 0.5:
-                img_uint8 = (img * 255.0).to(torch.uint8)
-                img = F_v2.equalize(img_uint8).to(torch.float32) / 255.0
+                if aug_cfg.dynamic_crop:
+                    img = apply_dynamic_crop_gpu(img)
 
-            # Standard spatial and color transformations
-            img = gpu_transforms(img)
+                if aug_cfg.equalize_p > 0 and random.random() < aug_cfg.equalize_p:
+                    img_uint8 = (img * 255.0).to(torch.uint8)
+                    img = F_v2.equalize(img_uint8).to(torch.float32) / 255.0
 
-            # Renormalize back to ImageNet standard for ResNet encoder
-            img = (img - mean_t) / std_t
+                if aug is not None:
+                    img = aug(img)
+
+                if aug_cfg.speckle_std > 0:
+                    img = (img + torch.randn_like(img) * aug_cfg.speckle_std).clamp(0, 1)
+
+                # Renormalize back to ImageNet standard for the frozen encoder
+                img = (img - mean_t) / std_t
             # ==========================================
 
             # The encoder is frozen: skip autograd graph construction for it
@@ -258,25 +268,19 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 # Save model only if Sample AUROC is the maximum
                 current_auroc_score = auroc_sp
 
-                if current_auroc_score > best_avg_score:
+                if auroc_sp > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
-                    torch.save(
-                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
-                        f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth",
-                    )
-                    best_avg_score = current_auroc_score
+                    best_ckpt = f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth"
+                    torch.save({'bn': bn.state_dict(), 'decoder': decoder.state_dict()}, best_ckpt)
+                    best_avg_score = auroc_sp
+                    best_epoch = epoch + 1
+                    best_ckpt_path = best_ckpt
                     best_metrics = (auroc_sp,)
-               
-                if vis == 1:  # Visualization output when no mask
-                    evaluation_visualization_no_seg(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
 
             # Test set with mask and need localization
             if seg == 1:
-                # Go through normal process
-                # Plot
-                if vis == 1:
-                    evaluation_visualization(encoder, bn, decoder, res, test_dataloader, device, print_canshu, score_num, img_path)
-                # This part calculates the basic results and saves the results of the current epoch.
+                # Metrics only during training. Anomaly maps are generated once at
+                # the end, on the best checkpoint (see the post-training block).
                 auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
                 
                 print(f'Pixel AUROC: {auroc_px:.3f}, Sample AUROC: {auroc_sp:.3f}, AUPRO: {aupro:.3f}')
@@ -305,9 +309,100 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                         {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
                         f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth",
                     )
+                    best_ckpt = f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth"
+                    torch.save(
+                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
+                        best_ckpt,
+                    )
+
                     best_avg_score = current_avg_score
+
+                    best_epoch = epoch + 1
+                    best_ckpt_path = best_ckpt
                     
                     best_metrics = (auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px)
+
+    if seg == 0 and vis == 1 and best_ckpt_path is not None:
+        state = torch.load(best_ckpt_path, map_location=device)
+        decoder.load_state_dict(state['decoder'])
+        bn.load_state_dict(state['bn'])
+
+        cm, thr, metrics = evaluation_visualization_no_seg(
+            encoder, bn, decoder, res, test_dataloader, device,
+            score_num, img_path)
+
+        cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm_mat, annot=True, fmt='d', cmap='Blues', cbar=True,
+                    xticklabels=['pred good', 'pred anom'],
+                    yticklabels=['true good', 'true anom'])
+        plt.ylabel('True'); plt.xlabel('Pred')
+        plt.title(f'Confusion Matrix (best ep{best_epoch}) @thr={thr:.4f}')
+        plt.savefig(os.path.join(img_path, 'confusion_matrix.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f'[best ckpt ep{best_epoch}] @thr={thr:.4f}  cm={cm}')
+        print(f'  AUROC={metrics["auroc"]}  F1={metrics["f1"]}  '
+              f'Precision={metrics["precision"]}  Average Precision={metrics["ap"]} Recall={metrics["recall"]}  '
+              f'Accuracy={metrics["accuracy"]} Balanced Acc={metrics["balanced_accuracy"]}')
+
+        with open(os.path.join(img_path, 'metrics.txt'), 'w') as f:
+            f.write(f'best_epoch\t{best_epoch}\n')
+            f.write(f'threshold\t{thr:.6f}\n')
+            for k, v in metrics.items():
+                f.write(f'{k}\t{v}\n')
+            for k, v in cm.items():
+                f.write(f'{k}\t{v}\n')
+
+    if seg == 1 and best_ckpt_path is not None:
+        os.makedirs(img_path, exist_ok=True)
+        
+        state = torch.load(best_ckpt_path, map_location=device)
+        decoder.load_state_dict(state['decoder'])
+        bn.load_state_dict(state['bn'])
+        
+        auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp, optimal_f1_px = evaluation(
+            encoder, bn, decoder, res, test_dataloader, device, img_path
+        )
+        
+        # Anomaly maps + GT overlays, generated once on the best checkpoint
+        if vis == 1:
+            cm, thr, cls_metrics = evaluation_visualization(
+                encoder, bn, decoder, res, test_dataloader, device,
+                print_canshu, score_num, img_path)
+
+            cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(cm_mat, annot=True, fmt='d', cmap='Blues', cbar=True,
+                        xticklabels=['pred good', 'pred anom'],
+                        yticklabels=['true good', 'true anom'])
+            plt.ylabel('True'); plt.xlabel('Pred')
+            plt.title(f'Confusion Matrix (best ep{best_epoch}) @thr={thr:.4f}')
+            plt.savefig(os.path.join(img_path, 'confusion_matrix.png'),
+                        dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f'[best ckpt ep{best_epoch}] @thr={thr:.4f}  cm={cm}')
+
+        report_text = textwrap.dedent(f"""\
+            ================ EVALUATION REPORT ================
+            AUROC (Pixel-level):            {auroc_px:.4f}
+            AUROC (Sample-level):           {auroc_sp:.4f}
+            AUPRO:                          {aupro:.4f}
+            AP (Localization):              {ap_loc:.4f}
+            F1 (Sample-level):              {optimal_f1_sp:.4f}
+            Precision (Sample):             {optimal_prec_sp:.4f}
+            Recall (Sample):                {optimal_rec_sp:.4f}
+            F1 (Pixel-level):               {optimal_f1_px:.4f}
+            ===================================================
+        """)
+        print(report_text)
+        
+        file_path = os.path.join(img_path, 'metrics.txt')
+        with open(file_path, "w") as file:
+            file.write(report_text)
+
+        print(f"Report successfully saved to: {file_path}")
     return best_metrics
 
 if __name__ == '__main__':
@@ -334,7 +429,12 @@ if __name__ == '__main__':
     parser.add_argument('--print_max', default=1, type=int)  # Whether to print the best AUC
     parser.add_argument('--net', default='wide_res50', type=str)  # Available net types, can choose res18, res34, res50, wide_res50
     parser.add_argument('--L2', default=0, type=int)  # Whether to use L2 loss function
+    parser.add_argument('--aug-config', dest='aug_config', default=None, type=str)  # path to AugConfig JSON; None => baseline
+    parser.add_argument('--image-size', default=256, type=int, help='Size of the input images (height and width)')
+    parser.add_argument('--image-isize', default=256, type=int, help='Size of the input images for the encoder (height and width)')
     args = parser.parse_args()
+
+    aug_cfg = AugConfig.from_json(args.aug_config) if args.aug_config else AugConfig()
 
     print('--------args----------')
     for k in list(vars(args).keys()):
@@ -355,7 +455,7 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name)
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize)
             print('*************************')  
 
     if args.class_ != 'all':
@@ -363,5 +463,5 @@ if __name__ == '__main__':
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name)
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize)
                 print('*************************') 

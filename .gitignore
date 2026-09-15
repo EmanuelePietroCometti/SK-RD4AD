@@ -11,3 +11,5 @@ tuning_ckpoints
 sk_rd4ad_tuning.db
 exports/
 hyperparameter_finetuning/
+configs/
+ablation_*

@@ -154,7 +154,7 @@ class MVTecDataset_no_seg(torch.utils.data.Dataset):
         
         img = self.transform(img)
             
-        return img, label, img_type
+        return img, label, img_type, img_path
     
 
 #######################  VAD   ###############################
