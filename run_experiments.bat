@@ -29,7 +29,7 @@ for %%c in (%classes%) do (
             --project_name skrd4ad_%%c ^
             --net wide_res50 ^
             --vis 1 ^
-            --aug-config configs\oat_hue.json ^
+            --aug-config configs\aug_legacy.json ^
             --image-size 512 ^
             --image-isize 256 ^
             --rate 0.05 ^

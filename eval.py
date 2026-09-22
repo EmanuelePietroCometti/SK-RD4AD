@@ -177,6 +177,10 @@ def evaluate_and_save_maps(args):
         decoder.load_state_dict(checkpoint['decoder'])
         if 'bn' in checkpoint:
             bn.load_state_dict(checkpoint['bn'])
+        if 'encoder' in checkpoint:
+            # Checkpoint addestrato con teacher custom: l'encoder ImageNet costruito sopra non è quello giusto
+            encoder.load_state_dict(checkpoint['encoder'])
+            print(f"Teacher custom caricato dal checkpoint ({checkpoint.get('encoder_ckpt', '?')})")
     else:
         decoder.load_state_dict(checkpoint)
 
