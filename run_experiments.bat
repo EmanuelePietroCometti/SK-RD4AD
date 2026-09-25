@@ -2,7 +2,7 @@
 setlocal
 
 REM Array of classes
-set "classes=carpet reda_baseline reda_dustOnValidation reda_dustOnValidationAndTrain"
+set "classes=carpet tessuto_nero tessuto_nero_dust_train tessuto_nero_dust_validation"
 
 REM Array of seeds
 set "seeds=0 1 2 42 101"
