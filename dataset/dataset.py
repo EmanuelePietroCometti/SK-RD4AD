@@ -63,6 +63,10 @@ class MVTecDataset(torch.utils.data.Dataset):
                            glob.glob(os.path.join(self.gt_path, defect_type) + "/*.bmp")
                 img_paths.sort()
                 gt_paths.sort()
+                if len(gt_paths) != len(img_paths):
+                    # ground_truth/ contiene maschere anche per immagini che non sono in test/
+                    # (es. maschere condivise tra train, validation e test): accoppia per nome.
+                    gt_paths = self._match_masks_by_name(img_paths, gt_paths, defect_type)
                 img_tot_paths.extend(img_paths)
                 gt_tot_paths.extend(gt_paths)
                 tot_labels.extend([1] * len(img_paths))
@@ -71,6 +75,37 @@ class MVTecDataset(torch.utils.data.Dataset):
         assert len(img_tot_paths) == len(gt_tot_paths), "Mismatch between test images and ground truth pairs!"
 
         return img_tot_paths, gt_tot_paths, tot_labels, tot_types
+
+    @staticmethod
+    def _match_masks_by_name(img_paths, gt_paths, defect_type):
+        """Per ogni immagine di test restituisce la maschera con lo stesso nome
+        (accetta '<nome>.ext' e '<nome>_mask.ext'); ignora le maschere senza immagine."""
+        def stem(p):
+            return os.path.splitext(os.path.basename(p))[0]
+
+        gt_by_stem = {}
+        for p in gt_paths:
+            s = stem(p)
+            gt_by_stem.setdefault(s, p)
+            if s.endswith("_mask"):
+                gt_by_stem.setdefault(s[:-len("_mask")], p)
+
+        matched, missing = [], []
+        for p in img_paths:
+            s = stem(p)
+            if s in gt_by_stem:
+                matched.append(gt_by_stem[s])
+            else:
+                missing.append(os.path.basename(p))
+
+        if missing:
+            raise FileNotFoundError(
+                f"[dataset] '{defect_type}': {len(missing)} immagini di test senza maschera "
+                f"con lo stesso nome in ground_truth/, es. {missing[:10]}")
+
+        # print(f"[dataset] '{defect_type}': {len(img_paths)} immagini, {len(gt_paths)} maschere "
+        #     f"-> accoppiate per nome, ignorate {len(gt_paths) - len(matched)} maschere senza immagine di test")
+        return matched
 
     def __len__(self):
         return len(self.img_paths)

@@ -13,3 +13,4 @@ exports/
 hyperparameter_finetuning/
 configs/
 ablation_*
+datasets/
