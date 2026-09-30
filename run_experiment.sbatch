@@ -48,7 +48,7 @@ for SEED in "${SEEDS[@]}"; do
         --epochs 200 \
         --res 3 \
         --learning_rate 0.005 \
-        --batch_size 16 \
+        --batch_size 32 \
         --seed "$SEED" \
         --class_ "$CLASS" \
         --L2 2 \
