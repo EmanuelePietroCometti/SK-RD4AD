@@ -8,7 +8,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu_a40
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=nome.cognome@studenti.polito.it
+#SBATCH --mail-user=s346291@studenti.polito.it
 #SBATCH --output=logs/%x_%j.out
 
 CLASS=$1

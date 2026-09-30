@@ -2,7 +2,7 @@
 setlocal
 
 REM Array of classes
-set "classes=carpet dataset_tessuto_nero tessuto_nero_dust_train tessuto_nero_dust_validation"
+set "classes=carpet tessuto_nero tessuto_nero_dust_validation tessuto_nero_dust_train"
 
 REM Array of seeds
 set "seeds=0 1 2 42 101"
@@ -24,7 +24,7 @@ for %%c in (%classes%) do (
             --layerloss 1 ^
             --seg 1 ^
             --print_epoch 10 ^
-            --data_path mvtec/ ^
+            --data_path "D:\emanuele\Code\dataset" ^
             --ckpt_path checkpoints/ ^
             --project_name skrd4ad_%%c ^
             --net wide_res50 ^
