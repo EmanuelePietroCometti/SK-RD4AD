@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os 
 import textwrap
+from model.custom_encoder import load_custom_encoder
 
 from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
 
@@ -105,7 +106,7 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None, image_size=256, image_isize=256):
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None, image_size=256, image_isize=256, encoder_ckpt=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
     print(class_)
@@ -115,8 +116,9 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     if img_path:
         img_path = os.path.join(img_path, class_, f'seed_{seed}')
         os.makedirs(img_path, exist_ok=True)
+    teacher = os.path.splitext(os.path.basename(encoder_ckpt))[0] if encoder_ckpt else 'imagenet'
     run_name = project_name.format(
-        net=net, res=res, class_=class_, lr=learning_rate, seed=seed
+        net=net, res=res, class_=class_, lr=learning_rate, seed=seed, teacher=teacher
     )
 
     os.makedirs(ckpt_path, exist_ok=True)
@@ -178,6 +180,22 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         decoder = de_resnet50(pretrained=False)  # Decoder initialization
         decoder = decoder.to(device)
 
+
+    
+    # Teacher custom: sostituisce i pesi ImageNet. Resta congelato e in eval(), come quello di default
+    if encoder_ckpt:
+        load_custom_encoder(encoder, encoder_ckpt)
+        encoder.eval()
+
+    # Con un teacher custom il checkpoint lo include: eval/export che ricostruiscono
+    # l'encoder ImageNet sarebbero altrimenti incoerenti con il decoder, senza errori
+    def ckpt_state():
+        state = {'bn': bn.state_dict(), 'decoder': decoder.state_dict()}
+        if encoder_ckpt:
+            state['encoder'] = encoder.state_dict()
+            state['encoder_ckpt'] = encoder_ckpt
+        return state
+    
     optimizer = torch.optim.Adam(list(decoder.parameters())+list(bn.parameters()), lr=learning_rate, betas=(0.5,0.999))  # Pass a list of parameters to be optimized
 
     max_auc = []
@@ -305,15 +323,9 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
                 if current_avg_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
-                    torch.save(
-                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
-                        f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth",
-                    )
                     best_ckpt = f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth"
-                    torch.save(
-                        {'bn': bn.state_dict(), 'decoder': decoder.state_dict()},
-                        best_ckpt,
-                    )
+                    torch.save(ckpt_state(), best_ckpt)
+                    torch.save(ckpt_state(), best_ckpt)
 
                     best_avg_score = current_avg_score
 
@@ -432,6 +444,8 @@ if __name__ == '__main__':
     parser.add_argument('--aug-config', dest='aug_config', default=None, type=str)  # path to AugConfig JSON; None => baseline
     parser.add_argument('--image-size', default=256, type=int, help='Size of the input images (height and width)')
     parser.add_argument('--image-isize', default=256, type=int, help='Size of the input images for the encoder (height and width)')
+    parser.add_argument('--encoder-ckpt', dest='encoder_ckpt', default=None, type=str,
+                        help='Backbone fine-tuned (stessa architettura di --net) usato come teacher; None = ImageNet')
     args = parser.parse_args()
 
     aug_cfg = AugConfig.from_json(args.aug_config) if args.aug_config else AugConfig()
@@ -455,7 +469,7 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize)
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize, encoder_ckpt=args.encoder_ckpt)
             print('*************************')  
 
     if args.class_ != 'all':
@@ -463,5 +477,5 @@ if __name__ == '__main__':
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize)
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize, encoder_ckpt=args.encoder_ckpt)
                 print('*************************') 
