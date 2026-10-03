@@ -17,19 +17,19 @@ for %%c in (%classes%) do (
             --epochs 200 ^
             --res 3 ^
             --learning_rate 0.005 ^
-            --batch_size 8 ^
+            --batch_size 16 ^
             --seed %%s ^
             --class_ %%c ^
-            --L2 2 ^
+            --L2 0 ^
             --layerloss 1 ^
             --seg 1 ^
             --print_epoch 10 ^
             --data_path "D:/emanuele/Code/dataset/" ^
             --ckpt_path checkpoints/ ^
+            --aug-config aug_off.json ^
             --project_name skrd4ad_%%c ^
             --net wide_res50 ^
             --vis 1 ^
-            --aug-config configs\aug_legacy.json ^
             --image-size 512 ^
             --image-isize 256 ^
             --rate 0.05 ^

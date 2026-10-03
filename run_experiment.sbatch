@@ -49,10 +49,10 @@ for SEED in "${SEEDS[@]}"; do
         --epochs 200 \
         --res 3 \
         --learning_rate 0.005 \
-        --batch_size 32 \
+        --batch_size 16 \
         --seed "$SEED" \
         --class_ "$CLASS" \
-        --L2 2 \
+        --L2 0 \
         --layerloss 1 \
         --seg 1 \
         --print_epoch 10 \
@@ -61,7 +61,7 @@ for SEED in "${SEEDS[@]}"; do
         --project_name "skrd4ad_$CLASS" \
         --net wide_res50 \
         --vis 1 \
-        --aug-config "$REPO/configs/aug_legacy.json" \
+        --aug-config "$REPO/configs/aug_off.json" \
         --image-size 512 \
         --image-isize 256 \
         --rate 0.05 \
