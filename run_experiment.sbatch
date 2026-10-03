@@ -55,7 +55,7 @@ for SEED in "${SEEDS[@]}"; do
         --L2 0 \
         --layerloss 1 \
         --seg 1 \
-        --print_epoch 10 \
+        --print_epoch 20 \
         --data_path "$WORK/datasets/" \
         --ckpt_path "$RUN_WORK/checkpoints/" \
         --project_name "skrd4ad_$CLASS" \

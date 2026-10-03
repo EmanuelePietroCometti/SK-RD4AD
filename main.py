@@ -131,7 +131,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
     test_path = data_path + class_ 
 
     train_data = ImageFolder(root=train_path, loader=raw_tensor_loader)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=4, persistent_workers=True)
 
     data_transforms, _ = get_data_transforms(size=image_size, isize=image_size)
 
