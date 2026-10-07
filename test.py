@@ -30,6 +30,8 @@ from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F_v2
 import shutil
 
+from eval_config import EvalConfig
+
 plt.switch_backend('agg')
 
 def apply_dynamic_crop_gpu(images, masks=None, padding=30):
@@ -75,51 +77,96 @@ def apply_dynamic_crop_gpu(images, masks=None, padding=30):
     return torch.stack(cropped_imgs)
 
 # ---------------------------------------------------------------------------
-# CANONICAL ANOMALY-MAP DEFINITION — single source of truth for the whole repo.
+# ANOMALY-MAP DEFINITION — single source of truth for the whole repo.
 #
-# Pipeline: dynamic crop (on the DENORMALIZED [0,1] image, as in main.py's
-# training loop) -> sum of per-layer (1 - cosine similarity) maps, bilinearly
-# upsampled with align_corners=False -> Gaussian blur k=15, sigma=4, zero
-# padding -> image-level score = max of the BLURRED map.
+# Map = sum over the three layers of (1 - cosine similarity), bilinearly
+# upsampled, then Gaussian-blurred; image-level score = max of the BLURRED map.
+# Every free choice (blur sigma / kernel size / border handling, align_corners,
+# dynamic crop at evaluation) lives in EvalConfig (eval_config.py):
 #
-# sigma=4 is the kernel evaluation_me/evaluation used to SELECT the best
-# checkpoint during training, so training AUROCs remain valid under this
-# definition. eval.py, export_onnx_from_checkpoint.py (which bakes this blur
-# into the graph), calibrate_threshold.py and the inference runtime must all
-# import/reproduce exactly this; do not redefine the kernel elsewhere.
+#   preset "paper"     (default) the authors' repo: scipy gaussian_filter(sigma=4)
+#                      -> 33x33 kernel, symmetric ('reflect') borders,
+#                      align_corners=True, no crop at evaluation.
+#   preset "canonical" the former definition of this fork, ONNX-friendly:
+#                      15x15 kernel, zero padding, align_corners=False.
+#
+# GAUSS_KERNEL_SIZE / GAUSS_SIGMA / get_gaussian_kernel below describe the
+# "canonical" preset and are kept unchanged: an ONNX exporter that imports them
+# keeps baking the 15x15 zero-padded blur. Thresholds in calib.json are valid
+# only for the score they were computed with (see "score_definition" there).
 # ---------------------------------------------------------------------------
 GAUSS_KERNEL_SIZE = 15
 GAUSS_SIGMA = 4.0
 
-def get_gaussian_kernel(device):
-    x = torch.arange(GAUSS_KERNEL_SIZE, device=device).float() - GAUSS_KERNEL_SIZE // 2
-    gauss = torch.exp(-x**2 / (2 * GAUSS_SIGMA**2))
-    kernel = gauss[:, None] * gauss[None, :]
-    return (kernel / kernel.sum()).view(1, 1, GAUSS_KERNEL_SIZE, GAUSS_KERNEL_SIZE)
+_DEFAULT_EVAL_CFG = EvalConfig()  # preset "paper", crop off
 
-def compute_anomaly_map_torch(fs_list, ft_list, out_size):
-    """Canonical blurred anomaly map as a tensor [B, 1, out_size, out_size].
+
+def _resolve_eval_cfg(eval_cfg):
+    return _DEFAULT_EVAL_CFG.resolved() if eval_cfg is None else eval_cfg
+
+
+def gaussian_kernel_2d(size, sigma, device):
+    """Normalised 2-D Gaussian kernel [1, 1, size, size] (outer product of the 1-D profile)."""
+    x = torch.arange(size, device=device).float() - size // 2
+    gauss = torch.exp(-x**2 / (2 * sigma**2))
+    kernel = gauss[:, None] * gauss[None, :]
+    return (kernel / kernel.sum()).view(1, 1, size, size)
+
+
+def get_gaussian_kernel(device):
+    # preset "canonical" kernel (bit-identical to the previous implementation)
+    return gaussian_kernel_2d(GAUSS_KERNEL_SIZE, GAUSS_SIGMA, device)
+
+
+def _symmetric_index(n, p, device):
+    """Indices of the half-sample symmetric extension (d c b a | a b c d | d c b a) of a length-n axis.
+
+    This is scipy's mode='reflect' (default of gaussian_filter). torch's
+    padding_mode='reflect' is whole-sample and therefore NOT equivalent.
+    """
+    i = torch.arange(-p, n + p, device=device) % (2 * n)
+    return torch.where(i >= n, 2 * n - 1 - i, i)
+
+
+def blur_anomaly_map(anomaly_map, eval_cfg=None):
+    """Gaussian blur of a [B, 1, H, W] map according to EvalConfig."""
+    cfg = _resolve_eval_cfg(eval_cfg)
+    size = cfg.kernel_size()
+    kernel = gaussian_kernel_2d(size, cfg.blur_sigma, anomaly_map.device)
+    pad = size // 2
+    if cfg.blur_padding == 'zeros':
+        return F.conv2d(anomaly_map, kernel, padding=pad)
+    # 'symmetric': pad explicitly, then valid convolution
+    h, w = anomaly_map.shape[-2:]
+    idx_h = _symmetric_index(h, pad, anomaly_map.device)
+    idx_w = _symmetric_index(w, pad, anomaly_map.device)
+    padded = anomaly_map.index_select(2, idx_h).index_select(3, idx_w)
+    return F.conv2d(padded, kernel, padding=0)
+
+
+def compute_anomaly_map_torch(fs_list, ft_list, out_size, eval_cfg=None):
+    """Blurred anomaly map as a tensor [B, 1, out_size, out_size].
 
     Returns (blurred_map, per_layer_unblurred_maps). Image-level score is
-    blurred_map.amax() over the spatial dims.
+    blurred_map.amax() over the spatial dims. eval_cfg=None => preset "paper".
     """
+    cfg = _resolve_eval_cfg(eval_cfg)
     anomaly_map = None
     layer_maps = []
     for fs, ft in zip(fs_list, ft_list):
         a_map = 1 - F.cosine_similarity(fs, ft, dim=1).unsqueeze(1)  # (B,1,h,w)
-        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=False)
+        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=cfg.align_corners)
         layer_maps.append(a_map)
         anomaly_map = a_map if anomaly_map is None else anomaly_map + a_map
 
-    kernel = get_gaussian_kernel(anomaly_map.device)
-    blurred = F.conv2d(anomaly_map, kernel, padding=GAUSS_KERNEL_SIZE // 2)
+    blurred = blur_anomaly_map(anomaly_map, cfg)
     return blurred, layer_maps
 
-# Calculate anomaly score map (numpy wrapper around the canonical definition)
-def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='a'):
+# Calculate anomaly score map (numpy wrapper around the definition above)
+def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='a', eval_cfg=None):
     # amap_mode is kept for signature compatibility; only the additive mode
-    # exists now — it is the canonical definition (the 'mul' branch was unused).
-    blurred, layer_maps = compute_anomaly_map_torch(fs_list, ft_list, out_size)
+    # exists now (the 'mul' branch was unused).
+    blurred, layer_maps = compute_anomaly_map_torch(fs_list, ft_list, out_size, eval_cfg)
     a_map_list = [m.squeeze().cpu().detach().numpy() for m in layer_maps]
     return blurred.squeeze().cpu().detach().numpy(), a_map_list
 
@@ -190,14 +237,15 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     return pro_auc
 
 # Evaluation function without segmentation
-def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, score_num):
-    decoder.eval() 
+def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, score_num, eval_cfg=None):
+    decoder.eval()
     bn.eval()
     encoder.eval()
-    
+    eval_cfg = _resolve_eval_cfg(eval_cfg)
+
     # Lists to store sample-level labels and predictions
-    gt_list_sp = [] 
-    pr_list_sp = [] 
+    gt_list_sp = []
+    pr_list_sp = []
 
 
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -207,16 +255,18 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
         for (img, label, _, _) in dataloader:
             img = img.to(device)
 
-            # Denormalize, Crop, Renormalize
-            img = (img * std_t + mean_t).clamp(0, 1)
-            img = apply_dynamic_crop_gpu(img)
-            img = (img - mean_t) / std_t
+            # Optional dynamic crop (EvalConfig.dynamic_crop; the paper does not crop).
+            # Denormalize -> crop -> renormalize, only when requested.
+            if eval_cfg.dynamic_crop:
+                img = (img * std_t + mean_t).clamp(0, 1)
+                img = apply_dynamic_crop_gpu(img)
+                img = (img - mean_t) / std_t
 
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)
 
             # Calculate final anomaly map (supports any batch size)
-            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
+            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a', eval_cfg=eval_cfg)
             anomaly_map = anomaly_map.reshape(img.shape[0], -1)
 
             # Add sample-level labels
@@ -240,8 +290,9 @@ def evaluation_me(encoder, bn, decoder, res, dataloader, device, print_canshu, s
 # tp/tn/fp/fn subfolders and the confusion matrix is returned to the caller.
 def evaluation_visualization(encoder, bn, decoder, res, dataloader, device,
                              print_canshu, score_num, img_path,
-                             threshold=None, nest_by_type=True):
+                             threshold=None, nest_by_type=True, eval_cfg=None):
     decoder.eval(); bn.eval(); encoder.eval()
+    eval_cfg = _resolve_eval_cfg(eval_cfg)
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std_t  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
@@ -251,15 +302,18 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device,
             img = img.to(device)
             gt = gt.to(device)
 
-            # Canonical preprocessing: denormalize -> dynamic crop -> renormalize
+            # `img` below is the [0,1] image used for the overlay; `img_norm` is the
+            # model input. Without crop the model input is the dataloader tensor itself.
+            img_norm = img
             img = (img * std_t + mean_t).clamp(0, 1)
-            img, gt = apply_dynamic_crop_gpu(img, masks=gt)
-            img_norm = (img - mean_t) / std_t
+            if eval_cfg.dynamic_crop:
+                img, gt = apply_dynamic_crop_gpu(img, masks=gt)
+                img_norm = (img - mean_t) / std_t
 
             inputs = encoder(img_norm)
             outputs = decoder(bn(inputs), inputs[0:3], res)
 
-            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
+            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a', eval_cfg=eval_cfg)
             gt = (gt > 0.5).float()
 
             # Image-level score = max of the blurred map: the same definition
@@ -323,8 +377,9 @@ def evaluation_visualization(encoder, bn, decoder, res, dataloader, device,
 def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, device,
                                     score_num, img_path,
                                     threshold=None,
-                                    save_panel=True, nest_by_type=True):
+                                    save_panel=True, nest_by_type=True, eval_cfg=None):
     decoder.eval(); bn.eval(); encoder.eval()
+    eval_cfg = _resolve_eval_cfg(eval_cfg)
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std_t  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
@@ -332,13 +387,15 @@ def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, devic
     with torch.no_grad():
         for img, label, img_type, paths in dataloader:
             img = img.to(device)
+            img_norm = img  # model input; replaced only if the dynamic crop is on
             img = (img * std_t + mean_t).clamp(0, 1)
-            img = apply_dynamic_crop_gpu(img)
-            img_norm = (img - mean_t) / std_t
+            if eval_cfg.dynamic_crop:
+                img = apply_dynamic_crop_gpu(img)
+                img_norm = (img - mean_t) / std_t
 
             inputs = encoder(img_norm)
             outputs = decoder(bn(inputs), inputs[0:3], res)
-            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
+            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a', eval_cfg=eval_cfg)
 
             flat = anomaly_map.reshape(img.shape[0], -1)
             top_scores = np.sort(flat, axis=1)[:, -score_num:].mean(axis=1)
@@ -399,10 +456,11 @@ def evaluation_visualization_no_seg(encoder, bn, decoder, res, dataloader, devic
     return cm, threshold, metrics
 
 # Evaluation with segmentation (GPU-accelerated with full metrics)
-def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
+def evaluation(encoder, bn, decoder, res, dataloader, device, img_path, eval_cfg=None):
     decoder.eval()
     bn.eval()
-    
+    eval_cfg = _resolve_eval_cfg(eval_cfg)
+
     gt_list_px = []
     pr_list_px = []
     gt_list_sp = []
@@ -417,17 +475,18 @@ def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
             img = img.to(device, non_blocking=True)
             gt = gt.to(device, non_blocking=True)
 
-            # Canonical order (same as the training loop in main.py): the crop's
-            # 0.94 background threshold is defined on [0,1] images, so
-            # denormalize -> crop -> renormalize.
-            img = (img * std_t + mean_t).clamp(0, 1)
-            img, gt = apply_dynamic_crop_gpu(img, masks=gt)
-            img = (img - mean_t) / std_t
+            # Optional dynamic crop (EvalConfig.dynamic_crop; the paper does not crop).
+            # The crop's 0.94 background threshold is defined on [0,1] images, so
+            # denormalize -> crop -> renormalize, only when requested.
+            if eval_cfg.dynamic_crop:
+                img = (img * std_t + mean_t).clamp(0, 1)
+                img, gt = apply_dynamic_crop_gpu(img, masks=gt)
+                img = (img - mean_t) / std_t
 
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res)
 
-            anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, img.shape[-1])
+            anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, img.shape[-1], eval_cfg)
             gt = (gt > 0.5).float()
             
             # AUPRO Calculation (Requires CPU execution for regionprops)
@@ -491,9 +550,11 @@ def evaluation(encoder, bn, decoder, res, dataloader, device, img_path):
 
 
 # Evaluation with segmentation, very time-consuming
-def evaluation_visA(encoder, bn, decoder, res, dataloader, device, img_path):
+def evaluation_visA(encoder, bn, decoder, res, dataloader, device, img_path, eval_cfg=None):
+    # VisA path: preprocessing untouched (no crop); only the score definition is configurable.
     decoder.eval()
     bn.eval()
+    eval_cfg = _resolve_eval_cfg(eval_cfg)
     gt_list_px = []
     pr_list_px = []
     gt_list_sp = []
@@ -506,8 +567,8 @@ def evaluation_visA(encoder, bn, decoder, res, dataloader, device, img_path):
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], res) 
             # Compute anomaly maps using encoder's first three outputs and decoder's outputs
-            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a')
-            
+            anomaly_map, _ = cal_anomaly_map(inputs[0:3], outputs, img.shape[-1], amap_mode='a', eval_cfg=eval_cfg)
+
 
             gt[gt > 0.5] = 1
             gt[gt <= 0.5] = 0

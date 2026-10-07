@@ -23,6 +23,7 @@ import seaborn as sns
 import os 
 import textwrap
 from model.custom_encoder import load_custom_encoder
+from eval_config import EvalConfig, build_eval_config
 
 from test import evaluation_me, evaluation_visualization, evaluation, evaluation_visualization_no_seg, apply_dynamic_crop_gpu
 
@@ -106,7 +107,20 @@ def loss_function_2(a, b):  # Input two tensor arrays
     loss2 = loss2_1 + loss2_2
     return loss2
 
-def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None, image_size=256, image_isize=256, encoder_ckpt=None):
+# Criteria to pick the best checkpoint among the periodic evaluations (on the test set,
+# as in the authors' code). The reported metrics are the same whichever is chosen.
+#   'sample_auroc' image-level AUROC (default: what the HPO and the existing benchmarks assume)
+#   'paper'        authors' rule: with masks (seg=1) mean(pixel AUROC, AUPRO); without masks image AUROC
+SELECT_METRICS = ('sample_auroc', 'paper')
+
+def selection_score(select_metric, seg, auroc_px=None, auroc_sp=None, aupro=None):
+    if select_metric not in SELECT_METRICS:
+        raise ValueError(f"select_metric must be one of {SELECT_METRICS}, got {select_metric!r}")
+    if select_metric == 'paper' and seg == 1:
+        return (auroc_px + aupro) / 2
+    return auroc_sp
+
+def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data_path, ckpt_path, print_canshu, score_num, print_loss, img_path, vis, cut, layerloss, rate, print_max, net, L2, seed, project_name, aug_cfg=None, image_size=256, image_isize=256, encoder_ckpt=None, eval_cfg=None, select_metric='sample_auroc'):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
     print(class_)
@@ -188,9 +202,12 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         encoder.eval()
 
     # Con un teacher custom il checkpoint lo include: eval/export che ricostruiscono
-    # l'encoder ImageNet sarebbero altrimenti incoerenti con il decoder, senza errori
+    # l'encoder ImageNet sarebbero altrimenti incoerenti con il decoder, senza errori.
+    # aug_cfg / eval_cfg viaggiano col checkpoint (chiavi extra: chi legge solo 'bn',
+    # 'decoder' ed 'encoder' non e' toccato): eval.py ricostruisce cosi' lo stesso punteggio.
     def ckpt_state():
-        state = {'bn': bn.state_dict(), 'decoder': decoder.state_dict()}
+        state = {'bn': bn.state_dict(), 'decoder': decoder.state_dict(),
+                 'aug_cfg': aug_cfg.to_dict(), 'eval_cfg': eval_cfg.to_dict()}
         if encoder_ckpt:
             state['encoder'] = encoder.state_dict()
             state['encoder_ckpt'] = encoder_ckpt
@@ -212,6 +229,14 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         aug_cfg = AugConfig()  # enabled=False: clean baseline
     aug = build_gpu_augmentation(aug_cfg)
     print(f"[AUG] {aug_cfg.to_dict()}")
+
+    # Score definition (default: the authors' one). The dynamic crop at evaluation follows
+    # the training crop unless forced, so train and test preprocessing agree.
+    eval_cfg = (eval_cfg if eval_cfg is not None else EvalConfig()).resolved(aug_cfg)
+    print(f"[EVAL] {eval_cfg.to_dict()}")
+    if select_metric not in SELECT_METRICS:
+        raise ValueError(f"select_metric must be one of {SELECT_METRICS}, got {select_metric!r}")
+    print(f"[SELECT] best checkpoint by: {select_metric}")
 
     # Tensors for denormalization/normalization on device
     mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -273,7 +298,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         if (epoch + 1) % print_epoch == 0:
             # Test set without mask
             if seg == 0:
-                auroc_sp= evaluation_me(encoder,bn, decoder, res, test_dataloader, device, print_canshu, score_num)
+                auroc_sp= evaluation_me(encoder,bn, decoder, res, test_dataloader, device, print_canshu, score_num, eval_cfg=eval_cfg)
                 print('epoch:', (epoch + 1))
                 print('Sample Auroc{:.3f}'.format(auroc_sp))
                 max_auc.append(auroc_sp)
@@ -283,14 +308,15 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                     print('max_epoch = ', max_auc_epoch[max_auc.index(max(max_auc))])
                 print('------------------')
 
-                # Save model only if Sample AUROC is the maximum
-                current_auroc_score = auroc_sp
+                # Save model only if the selection score is the maximum (without masks: Sample AUROC
+                # for both criteria)
+                current_auroc_score = selection_score(select_metric, 0, auroc_sp=auroc_sp)
 
-                if auroc_sp > best_avg_score:
+                if current_auroc_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
                     best_ckpt = f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth"
-                    torch.save({'bn': bn.state_dict(), 'decoder': decoder.state_dict()}, best_ckpt)
-                    best_avg_score = auroc_sp
+                    torch.save(ckpt_state(), best_ckpt)
+                    best_avg_score = current_auroc_score
                     best_epoch = epoch + 1
                     best_ckpt_path = best_ckpt
                     best_metrics = (auroc_sp,)
@@ -299,8 +325,8 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
             if seg == 1:
                 # Metrics only during training. Anomaly maps are generated once at
                 # the end, on the best checkpoint (see the post-training block).
-                auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path)
-                
+                auroc_px, auroc_sp, aupro, ap_loc, f1, prec, rec, f1_px = evaluation(encoder, bn, decoder, res, test_dataloader, device, img_path, eval_cfg=eval_cfg)
+
                 print(f'Pixel AUROC: {auroc_px:.3f}, Sample AUROC: {auroc_sp:.3f}, AUPRO: {aupro:.3f}')
                 print(f'AP-loc: {ap_loc:.3f}, F1-Score: {f1:.3f}, Precision: {prec:.3f}, Recall: {rec:.3f}, F1-px: {f1_px:.3f}')
 
@@ -318,13 +344,13 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
                 print('max_pr = ', max(max_pr))
                 print('max_epoch = ', max_pr_epoch[max_pr.index(max(max_pr))])
 
-                # Save model only if Sample AUROC is the maximum
-                current_avg_score = auroc_sp
+                # Save model only if the selection score is the maximum
+                # ('sample_auroc': Sample AUROC; 'paper': mean of Pixel AUROC and AUPRO)
+                current_avg_score = selection_score(select_metric, 1, auroc_px=auroc_px, auroc_sp=auroc_sp, aupro=aupro)
 
                 if current_avg_score > best_avg_score:
                     print(f"New best model found at epoch {epoch+1} with Sample Auroc{auroc_sp:.3f}")
                     best_ckpt = f"{ckpt_prefix}_ep{epoch + 1}_seed{seed}_sample_auc={auroc_sp:.4f}.pth"
-                    torch.save(ckpt_state(), best_ckpt)
                     torch.save(ckpt_state(), best_ckpt)
 
                     best_avg_score = current_avg_score
@@ -341,7 +367,7 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
 
         cm, thr, metrics = evaluation_visualization_no_seg(
             encoder, bn, decoder, res, test_dataloader, device,
-            score_num, img_path)
+            score_num, img_path, eval_cfg=eval_cfg)
 
         cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
         plt.figure(figsize=(6, 5))
@@ -375,14 +401,14 @@ def train(class_, epochs, learning_rate, res, batch_size, print_epoch, seg, data
         bn.load_state_dict(state['bn'])
         
         auroc_px, auroc_sp, aupro, ap_loc, optimal_f1_sp, optimal_prec_sp, optimal_rec_sp, optimal_f1_px = evaluation(
-            encoder, bn, decoder, res, test_dataloader, device, img_path
+            encoder, bn, decoder, res, test_dataloader, device, img_path, eval_cfg=eval_cfg
         )
         
         # Anomaly maps + GT overlays, generated once on the best checkpoint
         if vis == 1:
             cm, thr, cls_metrics = evaluation_visualization(
                 encoder, bn, decoder, res, test_dataloader, device,
-                print_canshu, score_num, img_path)
+                print_canshu, score_num, img_path, eval_cfg=eval_cfg)
 
             cm_mat = np.array([[cm['tn'], cm['fp']], [cm['fn'], cm['tp']]])
             plt.figure(figsize=(6, 5))
@@ -443,12 +469,24 @@ if __name__ == '__main__':
     parser.add_argument('--L2', default=0, type=int)  # Whether to use L2 loss function
     parser.add_argument('--aug-config', dest='aug_config', default=None, type=str)  # path to AugConfig JSON; None => baseline
     parser.add_argument('--image-size', default=256, type=int, help='Size of the input images (height and width)')
-    parser.add_argument('--image-isize', default=256, type=int, help='Size of the input images for the encoder (height and width)')
+    parser.add_argument('--image-isize', default=256, type=int, help='Size of the input images for the encoder (height and width). Center crop is applied if different from --image-size. Default: same as --image-size.')
     parser.add_argument('--encoder-ckpt', dest='encoder_ckpt', default=None, type=str,
                         help='Backbone fine-tuned (stessa architettura di --net) usato come teacher; None = ImageNet')
+    parser.add_argument('--score-preset', dest='score_preset', default='paper', choices=['paper', 'canonical'],
+                        help="Definizione del punteggio: 'paper' = repo degli autori (gaussian_filter sigma=4, kernel 33, "
+                             "bordi riflessi, align_corners=True); 'canonical' = definizione precedente del fork "
+                             "(kernel 15, zero-padding, align_corners=False, compatibile con l'export ONNX)")
+    parser.add_argument('--eval-config', dest='eval_config', default=None, type=str,
+                        help='JSON EvalConfig che sovrascrive i campi del preset (blur_sigma, blur_kernel_size, blur_padding, align_corners, dynamic_crop)')
+    parser.add_argument('--eval-crop', dest='eval_crop', default='inherit', choices=['inherit', 'on', 'off'],
+                        help="Crop dinamico in valutazione: 'inherit' = segue dynamic_crop dell'AugConfig (default), 'on'/'off' forzano")
+    parser.add_argument('--select-metric', dest='select_metric', default='sample_auroc', choices=list(SELECT_METRICS),
+                        help="Criterio per scegliere il checkpoint migliore: 'sample_auroc' (default) oppure 'paper' "
+                             "(con maschere: media di AUROC pixel e AUPRO, come nel codice degli autori)")
     args = parser.parse_args()
 
     aug_cfg = AugConfig.from_json(args.aug_config) if args.aug_config else AugConfig()
+    eval_cfg = build_eval_config(args.score_preset, args.eval_config, args.eval_crop)
 
     print('--------args----------')
     for k in list(vars(args).keys()):
@@ -469,13 +507,13 @@ if __name__ == '__main__':
             print('*************************')
             print('seed:', seed)
             setup_seed(seed)
-            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize, encoder_ckpt=args.encoder_ckpt)
-            print('*************************')  
+            train(class_, epoch, args.learning_rate, args.res, args.batch_size, print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize, encoder_ckpt=args.encoder_ckpt, eval_cfg=eval_cfg, select_metric=args.select_metric)
+            print('*************************')
 
     if args.class_ != 'all':
             for seed in args.seed:
                 print('*************************')
                 print('seed:', seed)
                 setup_seed(seed)
-                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize, encoder_ckpt=args.encoder_ckpt)
-                print('*************************') 
+                train(args.class_, args.epochs, args.learning_rate, args.res, args.batch_size, args.print_epoch, args.seg, args.data_path, args.ckpt_path, args.print_canshu, args.score_num, args.print_loss, args.img_path, args.vis, args.cut, args.layerloss, args.rate, args.print_max, args.net, args.L2, seed, args.project_name, aug_cfg=aug_cfg, image_size=args.image_size, image_isize=args.image_isize, encoder_ckpt=args.encoder_ckpt, eval_cfg=eval_cfg, select_metric=args.select_metric)
+                print('*************************')

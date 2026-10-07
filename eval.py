@@ -9,7 +9,10 @@ from sklearn.metrics import (roc_auc_score, f1_score, precision_score,
                              recall_score, accuracy_score, confusion_matrix, 
                              precision_recall_curve, average_precision_score)
 from test import compute_pro, apply_dynamic_crop_gpu, compute_anomaly_map_torch
+from eval_config import EvalConfig
 from torch.utils.data import DataLoader
+from dataclasses import asdict, replace
+from types import SimpleNamespace
 import json
 
 from dataset.dataset import get_data_transforms, MVTecDataset, MVTecDataset_no_seg
@@ -45,16 +48,43 @@ def save_confusion_matrix_plot(cm, save_path, class_names=('Normal', 'Anomalous'
     plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
-def compute_image_anomaly_score_and_map(inputs, outputs, image_size):
+def compute_image_anomaly_score_and_map(inputs, outputs, image_size, eval_cfg=None):
     """
-    Computes the image-level anomaly score and spatial map using the CANONICAL
-    definition shared with test.py (and baked into the ONNX export): sum of
-    per-layer (1 - cosine similarity) maps upsampled with align_corners=False,
-    Gaussian blur k=15 sigma=4 with zero padding — the exact kernel used for
-    model selection during training. Score = max of the BLURRED map.
+    Computes the image-level anomaly score and spatial map using the definition
+    shared with test.py: sum of per-layer (1 - cosine similarity) maps, Gaussian
+    blur, score = max of the BLURRED map. The blur / align_corners / crop choices
+    come from EvalConfig (preset "paper" = authors' repo, "canonical" = former
+    ONNX-friendly k=15 zero-padded definition); see eval_config.py.
     """
-    anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, image_size)
+    anomaly_map, _ = compute_anomaly_map_torch(inputs[0:3], outputs, image_size, eval_cfg)
     return anomaly_map.max().item(), anomaly_map
+
+
+def resolve_eval_cfg(args, checkpoint):
+    """EvalConfig for this evaluation.
+
+    Starting point: the config stored in the checkpoint by main.py (so the score is the one
+    used in training/selection), else preset "paper". Explicit CLI options then override
+    only the fields they specify: --score-preset replaces the score fields, --eval-config
+    patches single fields, --eval-crop sets the crop.
+    """
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get('eval_cfg'), dict):
+        cfg, source = EvalConfig.from_dict(checkpoint['eval_cfg']), 'checkpoint'
+    else:
+        cfg, source = EvalConfig(), 'default'
+    if args.score_preset is not None:
+        cfg, source = EvalConfig.from_preset(args.score_preset, dynamic_crop=cfg.dynamic_crop), 'cli'
+    if args.eval_config is not None:
+        with open(args.eval_config, 'r') as f:
+            cfg, source = EvalConfig.from_dict({**asdict(cfg), **json.load(f)}), 'cli'
+    if args.eval_crop is not None:
+        crop = None if args.eval_crop == 'inherit' else (args.eval_crop == 'on')
+        cfg, source = replace(cfg, dynamic_crop=crop), 'cli'
+    # 'inherit' (None) follows the AugConfig stored in the checkpoint; without one => no crop
+    aug_dict = checkpoint.get('aug_cfg') if isinstance(checkpoint, dict) else None
+    inherited = bool(aug_dict.get('dynamic_crop', False)) if isinstance(aug_dict, dict) else False
+    cfg = cfg.resolved(SimpleNamespace(dynamic_crop=inherited))
+    return cfg, source
 
 def save_confusion_map(img_tensor, mask_tensor, anomaly_map_tensor, save_path, global_min=0.0, global_max=1.0, threshold=0.5):
     """
@@ -173,6 +203,11 @@ def evaluate_and_save_maps(args):
     
     print(f"Loading checkpoint from: {args.checkpoint_path}")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    eval_cfg, eval_cfg_source = resolve_eval_cfg(args, checkpoint)
+    print(f"[EVAL] score definition ({eval_cfg_source}): {eval_cfg.to_dict()}")
+    if eval_cfg.dynamic_crop:
+        print("[EVAL] WARNING: dynamic crop is ON. Thresholds in calib.json are computed on cropped images; "
+              "a runtime that cannot reproduce the crop (e.g. a static ONNX graph) will not match them.")
     if isinstance(checkpoint, dict) and 'decoder' in checkpoint:
         decoder.load_state_dict(checkpoint['decoder'])
         if 'bn' in checkpoint:
@@ -221,18 +256,27 @@ def evaluate_and_save_maps(args):
                     raise RuntimeError("Dataset returned neither a label nor a mask.")
             
             # NOTE (ONNX/deployment parity): the content-dependent dynamic crop
-            # (apply_dynamic_crop_gpu, 0.94 background threshold) was REMOVED.
-            # It cannot be baked into a static ONNX graph, so keeping it here would
-            # compute the decision threshold on a score distribution the exported
-            # model cannot reproduce. The image is now fed to the encoder exactly as
-            # the export pipeline preprocesses it (resize + in-graph normalize, no
-            # crop). See the thesis note on preprocessing parity.
+            # (apply_dynamic_crop_gpu, 0.94 background threshold) cannot be baked into a
+            # static ONNX graph, so by default (EvalConfig.dynamic_crop False — the authors'
+            # preprocessing) the image goes to the encoder exactly as the export pipeline
+            # preprocesses it (resize + in-graph normalize, no crop). It is applied here only
+            # if the resolved EvalConfig asks for it, so that the threshold in calib.json
+            # matches the preprocessing used in training/selection.
+            if eval_cfg.dynamic_crop:
+                mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                img01 = (img * std_t + mean_t).clamp(0, 1)
+                if mask is not None:
+                    img01, mask = apply_dynamic_crop_gpu(img01, masks=mask)
+                else:
+                    img01 = apply_dynamic_crop_gpu(img01)
+                img = (img01 - mean_t) / std_t
 
             # Forward pass
             inputs = encoder(img)
             outputs = decoder(bn(inputs), inputs[0:3], args.res)
-            
-            score, anomaly_map = compute_image_anomaly_score_and_map(inputs, outputs, image_size)
+
+            score, anomaly_map = compute_image_anomaly_score_and_map(inputs, outputs, image_size, eval_cfg)
             
             # Store everything on CPU to avoid GPU OOM on large datasets
             results_memory.append({
@@ -278,6 +322,9 @@ def evaluate_and_save_maps(args):
         "normalization_formula": "anomalib_centered",
         "calibration_split": "test",
         "calibration_method": "f1_optimal",
+        # Additive field: the thresholds above are valid only for this score definition
+        # (blur kernel/padding, align_corners, crop). Consumers of the keys above are unaffected.
+        "score_definition": eval_cfg.to_dict(),
     }
     calib_path = args.checkpoint_path + ".calib.json"
     with open(calib_path, "w", encoding="utf-8") as f:
@@ -402,6 +449,13 @@ if __name__ == '__main__':
     parser.add_argument('--seg', default=1, type=int, help='0 for no segmentation, 1 with segmentation masks')
     parser.add_argument('--res', default=3, type=int, help='Skip connection parameter used during training')
     parser.add_argument('--net', default='wide_res50', type=str, help='Network architecture')
-    
+    parser.add_argument('--score-preset', dest='score_preset', default=None, choices=['paper', 'canonical'],
+                        help="Score definition: 'paper' (authors' repo) or 'canonical' (former k=15 zero-padded "
+                             "definition, ONNX-friendly). Default: the one stored in the checkpoint, else 'paper'")
+    parser.add_argument('--eval-config', dest='eval_config', default=None, type=str,
+                        help='EvalConfig JSON overriding the preset fields')
+    parser.add_argument('--eval-crop', dest='eval_crop', default=None, choices=['inherit', 'on', 'off'],
+                        help="Dynamic crop at evaluation. Default: the setting stored in the checkpoint, else off")
+
     args = parser.parse_args()
     evaluate_and_save_maps(args)

@@ -24,23 +24,48 @@ SK-RD4AD (Skip-Connected Reverse Distillation for Anomaly Detection) introduces 
 
 ---
 
-## 📐 Canonical inference pipeline (training ↔ ONNX parity)
+## 📐 Score definition and inference pipeline (training ↔ evaluation ↔ ONNX parity)
 
 Every score-producing path in this repo — training-time model selection
-(`test.py`), the reference evaluation (`eval.py`), the ONNX export
-(`export_onnx_from_checkpoint.py`, contract 2.0) and the production runtime —
-implements **one** definition:
+(`test.py`), the reference evaluation (`eval.py`) and, downstream, the ONNX export
+and the production runtime — implements **one** definition, selected by an
+`EvalConfig` (`eval_config.py`, same philosophy as `AugConfig`). Two presets:
+
+| preset | blur | padding | `align_corners` | role |
+|---|---|---|---|---|
+| `paper` (**default**) | σ=4, kernel 33 (`scipy.ndimage.gaussian_filter` default) | symmetric (scipy `reflect`) | `True` | the authors' repo ([pej0918/SK-RD4AD](https://github.com/pej0918/SK-RD4AD)) |
+| `canonical` | σ=4, kernel 15 | zeros | `False` | former definition of this fork, the one baked into the ONNX graph |
 
 ```
-resize 256 → scale to [0,1] → dynamic crop (bg 0.94, pad 30) → ImageNet normalize
-→ sum of per-layer (1 − cos similarity) maps, bilinear align_corners=False
-→ Gaussian blur k=15 σ=4 zero-padding   (baked INTO the ONNX graph)
-→ image score = max of the BLURRED map  (baked INTO the ONNX graph)
+resize 256 → scale to [0,1] → [dynamic crop, optional] → ImageNet normalize
+→ sum of per-layer (1 − cos similarity) maps, bilinear (align_corners per preset)
+→ Gaussian blur (kernel / padding per preset)
+→ image score = max of the BLURRED map
 ```
 
-The single source of truth is `test.py` (`GAUSS_KERNEL_SIZE`, `GAUSS_SIGMA`,
-`get_gaussian_kernel`, `compute_anomaly_map_torch`) — never redefine the kernel
-or the map elsewhere. Workflow for shipping a model:
+Choices that change the score are explicit and travel with the run:
+
+* `--score-preset {paper,canonical}` (default `paper`), `--eval-config cfg.json` (patches single fields: `blur_sigma`,
+  `blur_kernel_size`, `blur_padding`, `align_corners`, `dynamic_crop`) and `--eval-crop {inherit,on,off}` are accepted by
+  `main.py` and `eval.py`. `eval.py` without these flags reuses the `eval_cfg` stored in the checkpoint.
+* The dynamic crop at evaluation follows `AugConfig.dynamic_crop` (`inherit`, default), so training and evaluation always
+  use the same preprocessing; the authors' pipeline has no crop.
+* Augmentation stays fully configurable through `--aug-config` (`AugConfig`). Default: none (authors' setup).
+  `configs/aug_legacy.json` reproduces the pre-merge always-on pipeline of this fork.
+* `--select-metric {sample_auroc,paper}`: how the best checkpoint is chosen. `sample_auroc` (default) is image-level AUROC;
+  `paper` is the authors' rule (with masks: mean of pixel AUROC and AUPRO). Both select on the test set.
+* Checkpoints store `aug_cfg` and `eval_cfg` next to the weights; `<checkpoint>.calib.json` keeps all its keys and gains
+  `score_definition` (the `EvalConfig` its thresholds were computed with).
+
+**Thresholds are valid only for the score they were computed with.** The ONNX exporter / runtime bake the `canonical`
+blur (k=15, zero padding), so a model destined for ONNX must be calibrated with `canonical`:
+train as usual, then `python eval.py ... --score-preset canonical` writes the `calib.json` to ship. Code importing
+`compute_anomaly_map_torch` / `cal_anomaly_map` from `test.py` without an `eval_cfg` now gets `paper`; pass
+`eval_cfg=EvalConfig.from_preset("canonical")` to keep the previous behaviour.
+
+The single source of truth is `test.py` (`blur_anomaly_map`, `compute_anomaly_map_torch`, and for the
+`canonical` preset `GAUSS_KERNEL_SIZE`, `GAUSS_SIGMA`, `get_gaussian_kernel`) — never redefine the kernel
+or the map elsewhere. Workflow for shipping a model (all steps with the `canonical` preset):
 
 1. `python export_onnx_from_checkpoint.py ckpt.pth out.onnx --res <res>` — exports + verifies graph parity.
 2. `python parity_check.py --checkpoint ckpt.pth --model out.onnx --data_path ... --class_ ...` — PyTorch↔ONNX on real images (must PASS).
