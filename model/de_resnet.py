@@ -154,7 +154,6 @@ class Bottleneck(nn.Module):
 
         return out
 
-
 class ResNet(nn.Module):
 
     def __init__(
@@ -166,39 +165,30 @@ class ResNet(nn.Module):
         groups: int = 1,
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[List[bool]] = None,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        skip_mask: int = 3,
     ) -> None:
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
+        self.skip_mask = skip_mask  # bit0: y[2] -> layer2, bit1: y[1] -> layer3
 
         self.inplanes = 512 * block.expansion
         self.dilation = 1
         if replace_stride_with_dilation is None:
-            # each element in the tuple indicates if we should replace
-            # the 2x2 stride with a dilated convolution instead
             replace_stride_with_dilation = [False, False, False]
         if len(replace_stride_with_dilation) != 3:
             raise ValueError("replace_stride_with_dilation should be None "
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        #self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
-        #                       bias=False)
-        #self.bn1 = norm_layer(self.inplanes)
-        #self.relu = nn.ReLU(inplace=True)
-        #self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 256, layers[0], stride=2)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
         self.layer3 = self._make_layer(block, 64, layers[2], stride=2,
                                        dilate=replace_stride_with_dilation[1])
         self.relu = nn.ReLU(inplace=True)
-        #self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-        #                               dilate=replace_stride_with_dilation[2])
-        #self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        #self.fc = nn.Linear(512 * block.expansion, num_classes)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -207,9 +197,6 @@ class ResNet(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-        # Zero-initialize the last BN in each residual branch,
-        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
-        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
         if zero_init_residual:
             for m in self.modules():
                 if isinstance(m, Bottleneck):
@@ -242,34 +229,24 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def _forward_impl(self,  x, y, res ) -> Tensor:
-        # See note [TorchScript super()]
-        #x = self.conv1(x)
-        #x = self.bn1(x)
-        #x = self.relu(x)
-        #x = self.maxpool(x)
+    def _forward_impl(self, x, y=None, res: Optional[int] = None) -> List[Tensor]:
+        # res: 0 = nessuna skip, 1 = solo y[2], 2 = solo y[1], 3 = entrambe
+        mask = self.skip_mask if res is None else int(res)
+        use_a = bool(mask & 1)
+        use_b = bool(mask & 2)
 
-        # If res == 0, there is no skip connection; the forward pass is sequential through layer1, layer2, and layer3
-        if res == 0:
-            feature_a = self.layer1(x)  # 512*8*8->256*16*16
-            feature_b = self.layer2(feature_a)  # 256*16*16->128*32*32
-            feature_c = self.layer3(feature_b)  # 128*32*32->64*64*64
-        #feature_d = self.layer4(feature_c)  # 64*64*64->128*32*32
-        else :
-            feature_a = self.layer1(x)  # 512*8*8->256*16*16            
-            feature_b = self.layer2(self.relu(feature_a + y[2]))  # 256*16*16->128*32*32
-            feature_c = self.layer3(self.relu(feature_b + y[1]))  # 128*32*32->64*64*64
-
-        #x = self.avgpool(feature_d)
-        #x = torch.flatten(x, 1)
-        #x = self.fc(x)
+        feature_a = self.layer1(x)    # 512*8*8   -> 256*16*16 (x expansion)
+        h = self.relu(feature_a + y[2]) if use_a else feature_a
+        feature_b = self.layer2(h)    # 256*16*16 -> 128*32*32
+        h = self.relu(feature_b + y[1]) if use_b else feature_b
+        feature_c = self.layer3(h)    # 128*32*32 -> 64*64*64
 
         return [feature_c, feature_b, feature_a]
 
-    def forward(self, x,y,res) -> Tensor:
-        return self._forward_impl(x,y,res)
+    def forward(self, x, y=None, res: Optional[int] = None) -> List[Tensor]:
+        return self._forward_impl(x, y, res)
 
-
+    
 def _resnet(
     arch: str,
     block: Type[Union[BasicBlock, Bottleneck]],

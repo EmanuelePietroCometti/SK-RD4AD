@@ -32,11 +32,11 @@ from main import setup_seed
 # ======================================================================================
 NAME = "skrd4ad"
 DEFAULT_EPOCHS = 200
-DEFAULT_BATCH = 16  # default di main.py
+DEFAULT_BATCH = 32  # default di main.py
 
 # Architetture dal piu' piccolo al piu' grande (net-major)
 NETS = ["res18", "res34", "res50", "wide_res50"]
-RES = [1, 2, 3]
+RES = [0, 1, 2, 3]
 ALL_ARCHS = [f"{n}-res{r}" for n in NETS for r in RES]  # 12
 
 # Iperparametri di training (stadio B), griglia regolare; i default della repo stanno sulla griglia
@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results_dir", type=str, default="./results_optuna")
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
                    help="Epoche di OGNI trial = epoche della run finale")
-    p.add_argument("--eval_every", type=int, default=5, help="Ogni quante epoche si valuta (e si fa pruning)")
+    p.add_argument("--eval_every", type=int, default=20, help="Ogni quante epoche si valuta (e si fa pruning)")
     p.add_argument("--batch", type=int, default=DEFAULT_BATCH, help="Batch size fisso (default della repo)")
     p.add_argument("--tune_batch", action="store_true", help="Ottimizza il batch (4 8 16 32) invece di fissarlo")
     p.add_argument("--seed", type=int, default=42, help="Seed fisso dell'HPO (la run finale e' multi-seed)")
