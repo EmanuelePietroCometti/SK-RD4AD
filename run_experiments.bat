@@ -8,7 +8,7 @@ REM TRAIN=1 addestra e poi fa il test. TRAIN=0 salta il training e rifa solo tes
 set "TRAIN=1"
 
 REM Array of classes
-set "classes=carpet tessuto_nero tessuto_nero_dust_validation tessuto_nero_dust_train"
+set "classes=tessuto_nero_dust_train"
 
 REM Array of seeds
 set "seeds=0 1 2 42 101"
@@ -40,7 +40,7 @@ for %%c in (%classes%) do (
                 --aug-config configs\%AUG%.json ^
                 --score-preset paper ^
                 --project_name skrd4ad_%AUG%_%%c ^
-                --net wide_res50 ^
+                --net resnet18 ^
                 --vis 1 ^
                 --image-size 256 ^
                 --image-isize 256 ^
@@ -68,7 +68,7 @@ for %%c in (%classes%) do (
                     --img_path results_eval_%AUG%/%%c/seed_%%s/ ^
                     --seg 1 ^
                     --res 3 ^
-                    --net wide_res50
+                    --net resnet18
             )
         )
 

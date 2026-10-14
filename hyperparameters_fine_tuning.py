@@ -26,6 +26,19 @@ from optuna.distributions import IntDistribution
 from aug_config import AugConfig
 import main as skrd_main
 from main import setup_seed
+import argparse
+import gc
+import json
+import multiprocessing
+import time
+from pathlib import Path
+
+import optuna
+import torch
+from optuna.distributions import IntDistribution
+from optuna.trial import TrialState, create_trial
+
+
 
 # ======================================================================================
 # ADAPTER -- specifico di SK-RD4AD
@@ -46,6 +59,10 @@ SPACE = {
     "rate_i": IntDistribution(0, 5),   # 0 = loss ausiliaria spenta (layerloss=0); i>=1: 0.05*2**(i-1)
 }                                      #   -> 0, 0.05, 0.1, 0.2, 0.4, 0.8
 DEFAULT_IDX = {"lr_exp": 0, "L2": 0, "rate_i": 1}
+
+# Il batch size e' trattato allo stesso modo in entrambi gli script: FISSO (--batch) oppure, con
+# --tune_batch, ottimizzato sulla griglia 4 8 16 32.
+BATCH_SPACE = {"batch_exp": IntDistribution(2, 5)}  # batch = 2**e
 
 
 def decode(p: dict) -> dict:
@@ -129,23 +146,6 @@ def train_once(args, arch, cfg, tag, trial_number, on_eval, set_params) -> dict:
 # ======================================================================================
 # COMMON START -- blocco IDENTICO in hpo_ssn.py e hpo_skrd4ad.py (verificato con diff)
 # ======================================================================================
-import argparse
-import gc
-import json
-import multiprocessing
-import time
-from pathlib import Path
-
-import optuna
-import torch
-from optuna.distributions import IntDistribution
-from optuna.trial import TrialState, create_trial
-
-# Il batch size e' trattato allo stesso modo in entrambi gli script: FISSO (--batch) oppure, con
-# --tune_batch, ottimizzato sulla griglia 4 8 16 32.
-BATCH_SPACE = {"batch_exp": IntDistribution(2, 5)}  # batch = 2**e
-
-
 def space_of(args) -> dict:
     return {**SPACE, **(BATCH_SPACE if args.tune_batch else {})}
 
